@@ -8,8 +8,6 @@ Code provenance: generated with an LLM, GPT-5.5 xhigh.
 
 Public bot: https://t.me/wikipedia_unofficial_bot
 
-[![CI](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia/actions/workflows/ci.yml/badge.svg)](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia/actions/workflows/ci.yml)
-
 ## Screenshot
 
 ![Telegram chat with the bot showing Wikipedia search results and an article response](docs/screenshot.webp)
