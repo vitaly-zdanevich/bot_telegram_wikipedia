@@ -1,0 +1,12 @@
+/target/
+/build/
+/.tools/
+/.cargo/
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+*.tfvars.json
+.env
+*.env
+*.zip
