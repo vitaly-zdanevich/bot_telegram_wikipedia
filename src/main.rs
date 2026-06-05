@@ -879,48 +879,24 @@ impl App {
         if let Some(body_links_task) = body_links_task {
             match join_task(body_links_task).await {
                 Ok(links) => {
-                    if !links.is_empty() {
-                        self.send_html_message(
-                            chat_id,
-                            &html_bold("Article links"),
-                            Some(json!({
-                                "inline_keyboard": article_results_keyboard(
-                                    &language,
-                                    &links,
-                                    self.config.big_article_char_threshold,
-                                    self.config.small_article_char_threshold,
-                                    false
-                                )
-                            })),
-                        )
+                    self.send_article_buttons_message(chat_id, &language, "Article links", &links)
                         .await?;
-                    }
                 }
-                Err(err) => warn!(error = %err, "failed to fetch article body links"),
+                Err(err) => {
+                    warn!(error = %format_error_chain(&err), "failed to fetch article body links")
+                }
             }
         }
 
         if let Some(disambiguation_task) = disambiguation_task {
             match join_task(disambiguation_task).await {
                 Ok(links) => {
-                    if !links.is_empty() {
-                        self.send_html_message(
-                            chat_id,
-                            &html_bold("Disambiguation"),
-                            Some(json!({
-                                "inline_keyboard": article_results_keyboard(
-                                    &language,
-                                    &links,
-                                    self.config.big_article_char_threshold,
-                                    self.config.small_article_char_threshold,
-                                    false
-                                )
-                            })),
-                        )
+                    self.send_article_buttons_message(chat_id, &language, "Disambiguation", &links)
                         .await?;
-                    }
                 }
-                Err(err) => warn!(error = %err, "failed to fetch disambiguation links"),
+                Err(err) => {
+                    warn!(error = %format_error_chain(&err), "failed to fetch disambiguation links")
+                }
             }
         }
 
@@ -931,23 +907,18 @@ impl App {
                         if template.buttons.is_empty() {
                             continue;
                         }
-                        self.send_html_message(
+                        self.send_article_buttons_message_with_heading_html(
                             chat_id,
+                            &language,
                             &render_navigation_heading_html(&template),
-                            Some(json!({
-                                "inline_keyboard": article_results_keyboard(
-                                    &language,
-                                    &template.buttons,
-                                    self.config.big_article_char_threshold,
-                                    self.config.small_article_char_threshold,
-                                    false
-                                )
-                            })),
+                            &template.buttons,
                         )
                         .await?;
                     }
                 }
-                Err(err) => warn!(error = %err, "failed to fetch navigation template links"),
+                Err(err) => {
+                    warn!(error = %format_error_chain(&err), "failed to fetch navigation template links")
+                }
             }
         }
 
@@ -1016,6 +987,49 @@ impl App {
         }
 
         Ok(())
+    }
+
+    async fn send_article_buttons_message(
+        &self,
+        chat_id: i64,
+        language: &str,
+        heading: &str,
+        buttons: &[ArticleButton],
+    ) -> Result<()> {
+        self.send_article_buttons_message_with_heading_html(
+            chat_id,
+            language,
+            &html_bold(heading),
+            buttons,
+        )
+        .await
+    }
+
+    async fn send_article_buttons_message_with_heading_html(
+        &self,
+        chat_id: i64,
+        language: &str,
+        heading_html: &str,
+        buttons: &[ArticleButton],
+    ) -> Result<()> {
+        if buttons.is_empty() {
+            return Ok(());
+        }
+
+        self.send_html_message(
+            chat_id,
+            heading_html,
+            Some(json!({
+                "inline_keyboard": article_results_keyboard(
+                    language,
+                    buttons,
+                    self.config.big_article_char_threshold,
+                    self.config.small_article_char_threshold,
+                    false
+                )
+            })),
+        )
+        .await
     }
 
     async fn send_wikidata(&self, chat_id: i64, language: &str, item: &str) -> Result<()> {
