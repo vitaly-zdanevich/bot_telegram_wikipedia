@@ -144,6 +144,38 @@ Optional Lambda environment:
 - `ARTICLE_IMAGES_BUTTON_ONLY`: default `false`. When `true`, article images are
   offered through an `Images (N)` button instead of being sent automatically.
 
+## Favorite Categories
+
+Favorite category buttons are configured through Terraform variable
+`favorite_categories`, which becomes Lambda environment variable
+`FAVORITE_CATEGORIES`.
+
+Edit it directly in `infra/terraform.tfvars`:
+
+```hcl
+favorite_categories = "en:Physics|ka:თბილისი|be:Катэгорыя:Навука"
+```
+
+Entries are separated by `|`, comma, or newline. Each entry may be
+`lang:Category title`; the bot normalizes category prefixes such as `Category:`,
+`Категория:`, and `Катэгорыя:`.
+
+You can also use the wrapper script:
+
+```bash
+./scripts/favorite-category.sh list
+./scripts/favorite-category.sh add en Physics
+./scripts/favorite-category.sh add en Category:Physics
+./scripts/favorite-category.sh remove en Physics
+```
+
+After changing favorites, apply Terraform to update the Lambda environment. A
+Rust rebuild is not required for this config-only change:
+
+```bash
+terraform -chdir=infra apply
+```
+
 ## Build
 
 ```bash
