@@ -93,7 +93,7 @@ async fn handler(request: Request) -> Result<impl IntoResponse, Error> {
 
     let app = App::new(config)?;
     if let Err(err) = app.handle_update(update).await {
-        error!(error = %err, "failed to handle Telegram update");
+        error!(error = %format_error_chain(&err), "failed to handle Telegram update");
     }
 
     Ok(response(StatusCode::OK, "ok"))
@@ -114,6 +114,13 @@ fn parse_update(body: &Body) -> Result<Update> {
         Body::Empty => bail!("empty body"),
         _ => bail!("unsupported request body type"),
     }
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 #[derive(Clone)]
@@ -776,13 +783,20 @@ impl App {
     async fn send_article(&self, chat_id: i64, language: String, page_id: u64) -> Result<()> {
         self.send_chat_action(chat_id, "typing").await?;
 
-        let article = self
+        let article = match self
             .wiki
             .article_content(&language, page_id)
             .await
-            .with_context(|| {
-                format!("failed to fetch article page_id={page_id} from {language}")
-            })?;
+            .with_context(|| format!("failed to fetch article page_id={page_id} from {language}"))
+        {
+            Ok(article) => article,
+            Err(err) => {
+                warn!(error = %format_error_chain(&err), "failed to fetch article");
+                self.send_message(chat_id, "Article fetch failed. Please try again.", None)
+                    .await?;
+                return Ok(());
+            }
+        };
 
         let mut categories_task: Option<JoinHandle<Result<Vec<Category>>>> = None;
         let mut body_links_task: Option<JoinHandle<Result<Vec<ArticleButton>>>> = None;
@@ -1769,15 +1783,7 @@ impl WikiClient {
             ("redirects", "1".to_string()),
         ];
 
-        let response: ParseResponse = self
-            .http
-            .get(wiki_api_url(language)?)
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let response = self.article_parse_response(language, &params).await?;
 
         let parsed = response
             .parse
@@ -1821,6 +1827,44 @@ impl WikiClient {
             is_disambiguation,
             disambiguation_links,
         })
+    }
+
+    async fn article_parse_response(
+        &self,
+        language: &str,
+        params: &[(&str, String)],
+    ) -> Result<ParseResponse> {
+        let url = wiki_api_url(language)?;
+        let mut last_error = None;
+        for attempt in 1..=2 {
+            let result: Result<ParseResponse> = async {
+                let response = self
+                    .http
+                    .get(url.clone())
+                    .query(params)
+                    .send()
+                    .await
+                    .context("Wikipedia parse request failed")?
+                    .error_for_status()
+                    .context("Wikipedia parse request returned an error status")?;
+                response
+                    .json()
+                    .await
+                    .context("failed to decode Wikipedia parse response")
+            }
+            .await;
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(err) if attempt == 1 => {
+                    warn!(error = %format_error_chain(&err), "retrying Wikipedia article parse request");
+                    last_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_error.expect("article parse retry loop stores first error"))
     }
 
     async fn article_buttons_for_links(
