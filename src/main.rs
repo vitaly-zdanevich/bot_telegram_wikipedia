@@ -6281,7 +6281,7 @@ struct ParseResponse {
 struct ParsedPage {
     title: Option<String>,
     text: Option<String>,
-    properties: Option<HashMap<String, String>>,
+    properties: Option<HashMap<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7381,7 +7381,7 @@ mod tests {
             text: None,
             properties: Some(HashMap::from([(
                 "disambiguation".to_string(),
-                String::new(),
+                Value::String(String::new()),
             )])),
         };
         let html = r#"
@@ -7427,6 +7427,27 @@ mod tests {
         assert!(rendered.contains("Disambiguation page"));
         assert!(rendered.contains("Choose a target article"));
         assert!(!rendered.contains("This body must not be dumped"));
+    }
+
+    #[test]
+    fn parse_response_accepts_mixed_property_value_types() {
+        let response: ParseResponse = serde_json::from_str(
+            r#"{
+                "parse": {
+                    "title": "Porta Batumi Tower",
+                    "text": "<p>Body</p>",
+                    "properties": {
+                        "kartographer_frames": 1,
+                        "wikibase_item": "Q125293372"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let properties = response.parse.unwrap().properties.unwrap();
+        assert_eq!(properties.get("kartographer_frames"), Some(&json!(1)));
+        assert_eq!(properties.get("wikibase_item"), Some(&json!("Q125293372")));
     }
 
     #[test]
