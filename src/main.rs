@@ -4392,7 +4392,11 @@ fn normalize_wikidata_entity_id(value: &str) -> Option<String> {
 }
 
 fn wikidata_entity_url(entity_id: &str) -> String {
-    format!("https://www.wikidata.org/wiki/{entity_id}")
+    if entity_id.starts_with('P') {
+        format!("https://www.wikidata.org/wiki/Property:{entity_id}")
+    } else {
+        format!("https://www.wikidata.org/wiki/{entity_id}")
+    }
 }
 
 fn wikidata_action_info_url(item: &str) -> String {
@@ -6373,9 +6377,41 @@ mod tests {
             "<b><a href=\"https://www.wikidata.org/wiki/Q686963\">Armies of Exigo (Q686963)</a></b>"
         ));
         assert!(rendered.contains(
-            "<a href=\"https://www.wikidata.org/wiki/P31\">instance of (P31)</a>: <a href=\"https://www.wikidata.org/wiki/Q7889\">video game (Q7889)</a>"
+            "<a href=\"https://www.wikidata.org/wiki/Property:P31\">instance of (P31)</a>: <a href=\"https://www.wikidata.org/wiki/Q7889\">video game (Q7889)</a>"
         ));
         assert!(rendered.contains("Properties: 2"));
+    }
+
+    #[test]
+    fn wikidata_property_entity_urls_use_property_namespace() {
+        assert_eq!(
+            wikidata_entity_url("P12245"),
+            "https://www.wikidata.org/wiki/Property:P12245"
+        );
+        assert_eq!(
+            wikidata_entity_url("Q686963"),
+            "https://www.wikidata.org/wiki/Q686963"
+        );
+    }
+
+    #[test]
+    fn wikidata_url_values_render_clickable() {
+        let rendered = render_wikidata_snak_value(
+            &WikidataSnak {
+                datatype: Some("url".to_string()),
+                snaktype: Some("value".to_string()),
+                datavalue: Some(WikidataDataValue {
+                    value: Value::String("https://example.com/source".to_string()),
+                }),
+            },
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "<a href=\"https://example.com/source\">https://example.com/source</a>"
+        );
     }
 
     #[test]
