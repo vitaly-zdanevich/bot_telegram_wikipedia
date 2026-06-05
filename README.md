@@ -156,6 +156,11 @@ Lambda region to Wikimedia `eqiad` (Ashburn, Virginia). Wikimedia core
 application services are served from `eqiad` and `codfw`; if Wikimedia traffic
 routing changes for your users, override `aws_region` in Terraform.
 
+For the expected public-but-low-throughput bot traffic, Lambda should be
+practically free because AWS Lambda has a monthly free tier for requests and
+compute time. Check the current numbers on the official
+[AWS Lambda pricing page](https://aws.amazon.com/lambda/pricing/).
+
 This AWS account currently rejects Lambda memory above `3008` MB in `us-east-1`.
 If AWS raises the account/region limit to the newer `10240` MB maximum, set
 `memory_size_mb = 10240` for more CPU.
