@@ -316,10 +316,11 @@ impl App {
                 page_id,
                 kind,
                 page_index,
+                total_pages,
             }) => {
                 self.answer_callback_query(&callback.id, "Loading category page...", false)
                     .await?;
-                self.send_category_page(chat_id, &language, page_id, kind, page_index)
+                self.send_category_page(chat_id, &language, page_id, kind, page_index, total_pages)
                     .await?;
             }
             Ok(CallbackAction::ArticleCategory {
@@ -593,12 +594,15 @@ impl App {
         }
 
         if !subcategories.categories.is_empty() {
+            let total_pages =
+                category_total_pages(overview.subcategory_count, self.config.search_limit);
             self.send_html_message(
                 chat_id,
                 &render_category_subcategories_page_heading_html(
                     language,
                     title,
                     subcategories.page_index,
+                    total_pages,
                 ),
                 category_subcategories_keyboard_with_pagination(
                     language,
@@ -608,6 +612,7 @@ impl App {
                         page_id,
                         kind: CategoryPageKind::Subcategories,
                         page_index: subcategories.page_index,
+                        total_pages,
                         has_next: subcategories.has_next,
                     }),
                 ),
@@ -616,6 +621,8 @@ impl App {
         }
 
         if !articles.articles.is_empty() {
+            let total_pages =
+                category_total_pages(overview.article_count, self.config.search_limit);
             let reply_markup = category_articles_keyboard(
                 language,
                 &articles.articles,
@@ -627,13 +634,19 @@ impl App {
                     page_id,
                     kind: CategoryPageKind::Articles,
                     page_index: articles.page_index,
+                    total_pages,
                     has_next: articles.has_next,
                 }),
             );
 
             self.send_html_message(
                 chat_id,
-                &render_category_articles_page_heading_html(language, title, articles.page_index),
+                &render_category_articles_page_heading_html(
+                    language,
+                    title,
+                    articles.page_index,
+                    total_pages,
+                ),
                 reply_markup,
             )
             .await?;
@@ -649,6 +662,7 @@ impl App {
         page_id: u64,
         kind: CategoryPageKind,
         page_index: usize,
+        total_pages: Option<usize>,
     ) -> Result<()> {
         self.send_chat_action(chat_id, "typing").await?;
 
@@ -681,7 +695,12 @@ impl App {
 
                 self.send_html_message(
                     chat_id,
-                    &render_category_articles_page_heading_html(language, &title, page.page_index),
+                    &render_category_articles_page_heading_html(
+                        language,
+                        &title,
+                        page.page_index,
+                        total_pages,
+                    ),
                     category_articles_keyboard(
                         language,
                         &page.articles,
@@ -693,6 +712,7 @@ impl App {
                             page_id,
                             kind,
                             page_index: page.page_index,
+                            total_pages,
                             has_next: page.has_next,
                         }),
                     ),
@@ -730,6 +750,7 @@ impl App {
                         language,
                         &title,
                         page.page_index,
+                        total_pages,
                     ),
                     category_subcategories_keyboard_with_pagination(
                         language,
@@ -739,6 +760,7 @@ impl App {
                             page_id,
                             kind,
                             page_index: page.page_index,
+                            total_pages,
                             has_next: page.has_next,
                         }),
                     ),
@@ -1638,7 +1660,7 @@ impl WikiClient {
             ("action", "query".to_string()),
             ("format", "json".to_string()),
             ("formatversion", "2".to_string()),
-            ("prop", "extracts|categories".to_string()),
+            ("prop", "extracts|categories|categoryinfo".to_string()),
             ("titles", normalized_title),
             ("exintro", "1".to_string()),
             ("explaintext", "1".to_string()),
@@ -1667,6 +1689,8 @@ impl WikiClient {
             .extract
             .map(|extract| extract.trim().to_string())
             .filter(|extract| !extract.is_empty());
+        let article_count = page.categoryinfo.as_ref().map(|info| info.pages);
+        let subcategory_count = page.categoryinfo.as_ref().map(|info| info.subcats);
         let parent_categories = page
             .categories
             .unwrap_or_default()
@@ -1678,6 +1702,8 @@ impl WikiClient {
             .collect::<Vec<_>>();
         let overview = CategoryOverview {
             page_id: page.pageid,
+            article_count,
+            subcategory_count,
             description,
             parent_categories,
         };
@@ -3036,6 +3062,7 @@ enum CallbackAction {
         page_id: u64,
         kind: CategoryPageKind,
         page_index: usize,
+        total_pages: Option<usize>,
     },
     ArticleCategory {
         language: String,
@@ -3093,6 +3120,14 @@ fn parse_callback_data(
             .context("category page callback has no page index")?
             .parse::<usize>()
             .context("category page callback page index is invalid")?;
+        let total_pages = parts
+            .next()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .context("category page callback total page count is invalid")
+            })
+            .transpose()?;
         if parts.next().is_some() {
             bail!("category page callback has extra fields");
         }
@@ -3101,6 +3136,7 @@ fn parse_callback_data(
             page_id,
             kind,
             page_index,
+            total_pages,
         });
     }
 
@@ -3468,6 +3504,7 @@ struct CategoryPagination<'a> {
     page_id: u64,
     kind: CategoryPageKind,
     page_index: usize,
+    total_pages: Option<usize>,
     has_next: bool,
 }
 
@@ -3489,6 +3526,7 @@ fn category_pagination_row(pagination: CategoryPagination<'_>) -> Option<Vec<Val
             pagination.page_id,
             pagination.kind,
             pagination.page_index - 1,
+            pagination.total_pages,
         )
     {
         row.push(json!({
@@ -3502,6 +3540,7 @@ fn category_pagination_row(pagination: CategoryPagination<'_>) -> Option<Vec<Val
             pagination.page_id,
             pagination.kind,
             pagination.page_index + 1,
+            pagination.total_pages,
         )
     {
         row.push(json!({
@@ -3584,12 +3623,19 @@ fn category_page_callback_data(
     page_id: u64,
     kind: CategoryPageKind,
     page_index: usize,
+    total_pages: Option<usize>,
 ) -> Option<String> {
     let language = normalize_language_code(language)?;
-    let data = format!(
-        "catpage:{language}:{page_id}:{}:{page_index}",
-        kind.callback_code()
-    );
+    let data = match total_pages {
+        Some(total_pages) => format!(
+            "catpage:{language}:{page_id}:{}:{page_index}:{total_pages}",
+            kind.callback_code()
+        ),
+        None => format!(
+            "catpage:{language}:{page_id}:{}:{page_index}",
+            kind.callback_code()
+        ),
+    };
     (data.len() <= 64).then_some(data)
 }
 
@@ -3757,16 +3803,24 @@ fn render_category_subcategories_page_heading_html(
     language: &str,
     title: &str,
     page_index: usize,
+    total_pages: Option<usize>,
 ) -> String {
-    render_category_page_heading_html(language, title, "Subcategories in", page_index)
+    render_category_page_heading_html(language, title, "Subcategories in", page_index, total_pages)
 }
 
 fn render_category_articles_page_heading_html(
     language: &str,
     title: &str,
     page_index: usize,
+    total_pages: Option<usize>,
 ) -> String {
-    render_category_page_heading_html(language, title, "Newest article pages in", page_index)
+    render_category_page_heading_html(
+        language,
+        title,
+        "Newest article pages in",
+        page_index,
+        total_pages,
+    )
 }
 
 fn render_category_page_heading_html(
@@ -3774,14 +3828,26 @@ fn render_category_page_heading_html(
     title: &str,
     prefix: &str,
     page_index: usize,
+    total_pages: Option<usize>,
 ) -> String {
     let title = normalize_category_title_for_language(title, language);
     let linked_title = html_link(&article_url(language, &title), &title);
-    if page_index == 0 {
-        format!("{prefix} {linked_title}")
-    } else {
-        format!("{prefix} {linked_title} (page {})", page_index + 1)
+    let page_number = page_index + 1;
+    match total_pages {
+        Some(total_pages) if total_pages > 1 || page_index > 0 => {
+            format!(
+                "{prefix} {linked_title} (page {page_number}/{})",
+                total_pages.max(page_number)
+            )
+        }
+        _ if page_index > 0 => format!("{prefix} {linked_title} (page {page_number})"),
+        _ => format!("{prefix} {linked_title}"),
     }
+}
+
+fn category_total_pages(total_items: Option<usize>, page_size: usize) -> Option<usize> {
+    let page_size = page_size.clamp(1, MAX_SEARCH_LIMIT);
+    total_items.map(|total_items| total_items.div_ceil(page_size))
 }
 
 fn render_references_html_parts(references_html: &str, limit: usize) -> Vec<String> {
@@ -5911,6 +5977,8 @@ impl CategoryPageKind {
 #[derive(Debug, Clone)]
 struct CategoryOverview {
     page_id: Option<u64>,
+    article_count: Option<usize>,
+    subcategory_count: Option<usize>,
     description: Option<String>,
     parent_categories: Vec<Category>,
 }
@@ -6095,7 +6163,10 @@ struct InfoPage {
 
 #[derive(Debug, Deserialize)]
 struct CategoryInfoDto {
+    #[serde(default)]
     pages: usize,
+    #[serde(default)]
+    subcats: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6352,8 +6423,10 @@ mod tests {
 
     #[test]
     fn category_page_callback_round_trips_page_kind_and_index() {
-        let data = category_page_callback_data("EN", 98765, CategoryPageKind::Articles, 2).unwrap();
-        assert_eq!(data, "catpage:en:98765:a:2");
+        let data =
+            category_page_callback_data("EN", 98765, CategoryPageKind::Articles, 2, Some(10))
+                .unwrap();
+        assert_eq!(data, "catpage:en:98765:a:2:10");
 
         let action = parse_callback_data(&data, &[]).unwrap();
         match action {
@@ -6362,11 +6435,13 @@ mod tests {
                 page_id,
                 kind,
                 page_index,
+                total_pages,
             } => {
                 assert_eq!(language, "en");
                 assert_eq!(page_id, 98765);
                 assert_eq!(kind, CategoryPageKind::Articles);
                 assert_eq!(page_index, 2);
+                assert_eq!(total_pages, Some(10));
             }
             CallbackAction::Article { .. }
             | CallbackAction::Category { .. }
@@ -6375,6 +6450,14 @@ mod tests {
             | CallbackAction::Images { .. } => {
                 panic!("expected category page callback")
             }
+        }
+
+        let action = parse_callback_data("catpage:en:98765:a:2", &[]).unwrap();
+        match action {
+            CallbackAction::CategoryPage { total_pages, .. } => {
+                assert_eq!(total_pages, None);
+            }
+            _ => panic!("expected category page callback"),
         }
     }
 
@@ -6569,21 +6652,27 @@ mod tests {
     #[test]
     fn category_headings_link_full_category_title() {
         let rendered =
-            render_category_subcategories_page_heading_html("en", "Category:PC games", 0);
+            render_category_subcategories_page_heading_html("en", "Category:PC games", 0, None);
 
         assert!(rendered.starts_with("Subcategories in "));
         assert!(rendered.contains(
             "<a href=\"https://en.wikipedia.org/wiki/Category%3APC_games\">Category:PC games</a>"
         ));
 
-        let rendered = render_category_articles_page_heading_html("en", "Category:PC games", 0);
+        let rendered =
+            render_category_articles_page_heading_html("en", "Category:PC games", 0, None);
         assert!(rendered.starts_with("Newest article pages in "));
         assert!(rendered.contains(
             "<a href=\"https://en.wikipedia.org/wiki/Category%3APC_games\">Category:PC games</a>"
         ));
 
-        let rendered = render_category_articles_page_heading_html("en", "Category:PC games", 1);
+        let rendered =
+            render_category_articles_page_heading_html("en", "Category:PC games", 1, None);
         assert!(rendered.ends_with("(page 2)"));
+
+        let rendered =
+            render_category_articles_page_heading_html("en", "Category:PC games", 4, Some(10));
+        assert!(rendered.ends_with("(page 5/10)"));
     }
 
     #[test]
@@ -6605,6 +6694,7 @@ mod tests {
                 page_id: 98765,
                 kind: CategoryPageKind::Articles,
                 page_index: 1,
+                total_pages: Some(10),
                 has_next: true,
             }),
         )
@@ -6613,9 +6703,9 @@ mod tests {
         let rows = keyboard["inline_keyboard"].as_array().unwrap();
         let nav = rows.last().unwrap().as_array().unwrap();
         assert_eq!(nav[0]["text"], "Prev");
-        assert_eq!(nav[0]["callback_data"], "catpage:en:98765:a:0");
+        assert_eq!(nav[0]["callback_data"], "catpage:en:98765:a:0:10");
         assert_eq!(nav[1]["text"], "Next");
-        assert_eq!(nav[1]["callback_data"], "catpage:en:98765:a:2");
+        assert_eq!(nav[1]["callback_data"], "catpage:en:98765:a:2:10");
     }
 
     #[test]
@@ -6631,6 +6721,7 @@ mod tests {
                 page_id: 98765,
                 kind: CategoryPageKind::Subcategories,
                 page_index: 0,
+                total_pages: Some(3),
                 has_next: true,
             }),
         )
@@ -6640,7 +6731,7 @@ mod tests {
         let nav = rows.last().unwrap().as_array().unwrap();
         assert_eq!(nav.len(), 1);
         assert_eq!(nav[0]["text"], "Next");
-        assert_eq!(nav[0]["callback_data"], "catpage:en:98765:s:1");
+        assert_eq!(nav[0]["callback_data"], "catpage:en:98765:s:1:3");
     }
 
     #[test]
