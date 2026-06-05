@@ -38,7 +38,11 @@ const ARTICLE_TITLE_LOOKUP_LIMIT: usize = 50;
 const MEDIA_FILE_LOOKUP_LIMIT: usize = 30;
 const INLINE_MESSAGE_CHAR_LIMIT: usize = 3900;
 const INLINE_CACHE_TIME_SECONDS: u32 = 0;
+const WIKIDATA_ENTITY_BATCH_SIZE: usize = 50;
+const WIKIDATA_PROPERTY_DISPLAY_LIMIT: usize = 80;
+const WIKIDATA_VALUES_PER_PROPERTY_LIMIT: usize = 8;
 const REPOSITORY_URL: &str = "https://github.com/vitaly-zdanevich/bot_telegram_wikipedia";
+const WIKIDATA_API_URL: &str = "https://www.wikidata.org/w/api.php";
 
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static RAM_CACHE: OnceLock<Mutex<RamCache>> = OnceLock::new();
@@ -324,6 +328,11 @@ impl App {
                 };
                 self.send_category_members(chat_id, &language, &category.title)
                     .await?;
+            }
+            Ok(CallbackAction::Wikidata { language, item }) => {
+                self.answer_callback_query(&callback.id, "Loading Wikidata...", false)
+                    .await?;
+                self.send_wikidata(chat_id, &language, &item).await?;
             }
             Err(err) => {
                 warn!(error = %err, data, "ignored invalid callback data");
@@ -755,11 +764,22 @@ impl App {
             match join_task(metadata_task).await {
                 Ok(metadata) => {
                     let metadata_html = render_metadata_html(&metadata);
-                    for part in split_html_lines_for_telegram(
+                    let metadata_parts = split_html_lines_for_telegram(
                         &metadata_html,
                         self.config.message_char_limit,
-                    ) {
-                        self.send_html_message(chat_id, &part, None).await?;
+                    );
+                    let wikidata_keyboard = wikidata_metadata_keyboard(&metadata);
+                    for (index, part) in metadata_parts.iter().enumerate() {
+                        self.send_html_message(
+                            chat_id,
+                            part,
+                            if index == 0 {
+                                wikidata_keyboard.clone()
+                            } else {
+                                None
+                            },
+                        )
+                        .await?;
                     }
                 }
                 Err(err) => {
@@ -782,6 +802,49 @@ impl App {
                     .await?
                 }
                 Err(err) => warn!(error = %err, "failed to fetch article media"),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_wikidata(&self, chat_id: i64, language: &str, item: &str) -> Result<()> {
+        self.send_chat_action(chat_id, "typing").await?;
+
+        let claims = self.wiki.wikidata_claims(language, item);
+        let page_metadata = self
+            .wiki
+            .wikidata_page_metadata(item, self.config.metadata_revision_limit);
+        let (claims, page_metadata) = tokio::join!(claims, page_metadata);
+
+        match claims {
+            Ok(claims) => {
+                for part in
+                    render_wikidata_claims_html_parts(&claims, self.config.message_char_limit)
+                {
+                    self.send_html_message(chat_id, &part, None).await?;
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, item, "failed to fetch Wikidata claims");
+                self.send_message(chat_id, "Wikidata claims fetch failed.", None)
+                    .await?;
+            }
+        }
+
+        match page_metadata {
+            Ok(metadata) => {
+                let metadata_html = render_wikidata_page_metadata_html(&metadata);
+                for part in
+                    split_html_lines_for_telegram(&metadata_html, self.config.message_char_limit)
+                {
+                    self.send_html_message(chat_id, &part, None).await?;
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, item, "failed to fetch Wikidata page metadata");
+                self.send_message(chat_id, "Wikidata metadata fetch failed.", None)
+                    .await?;
             }
         }
 
@@ -1588,25 +1651,34 @@ impl WikiClient {
         let parts = self
             .article_metadata_parts(language, page_id, revision_limit)
             .await?;
+        let wikidata_entity = if let Some(wikidata_item) =
+            parts.info.page_props.get("wikibase_item")
+        {
+            self.wikidata_entity(wikidata_item)
+                .await
+                .map(Some)
+                .unwrap_or_else(|err| {
+                    warn!(error = %err, wikidata_item, "failed to fetch Wikidata entity for article metadata");
+                    None
+                })
+        } else {
+            None
+        };
         let commons_url = match commons_page_url(&parts.info.page_props) {
             Some(url) => Some(url),
-            None => {
-                if let Some(wikidata_item) = parts.info.page_props.get("wikibase_item") {
-                    self.wikidata_commons_url(wikidata_item)
-                        .await
-                        .unwrap_or_else(|err| {
-                            warn!(error = %err, wikidata_item, "failed to fetch Commons link from Wikidata");
-                            None
-                        })
-                } else {
-                    None
-                }
-            }
+            None => wikidata_entity
+                .as_ref()
+                .and_then(wikidata_commons_url_from_entity),
         };
+        let wikidata_property_count = wikidata_entity
+            .as_ref()
+            .and_then(|entity| entity.claims.as_ref())
+            .map(HashMap::len);
         let metadata = ArticleMetadata {
             language: language.to_string(),
             info: parts.info,
             commons_url,
+            wikidata_property_count,
             revisions: parts.revisions,
             external_links: parts.external_links,
             language_links: parts.language_links,
@@ -1616,18 +1688,25 @@ impl WikiClient {
         Ok(metadata)
     }
 
-    async fn wikidata_commons_url(&self, wikidata_item: &str) -> Result<Option<String>> {
+    async fn wikidata_entity(&self, wikidata_item: &str) -> Result<WikidataEntity> {
+        let wikidata_item =
+            normalize_wikidata_entity_id(wikidata_item).context("Wikidata item id is invalid")?;
+        let cache_key = format!("wikidata_entity:{wikidata_item}");
+        if let Some(entity) = self.cache_get(&cache_key, |cache| &mut cache.wikidata_entities) {
+            return Ok(entity);
+        }
+
         let params = vec![
             ("action", "wbgetentities".to_string()),
             ("format", "json".to_string()),
-            ("ids", wikidata_item.to_string()),
+            ("ids", wikidata_item.clone()),
             ("props", "sitelinks|claims".to_string()),
             ("sitefilter", "commonswiki".to_string()),
         ];
 
         let response: WikidataEntitiesResponse = self
             .http
-            .get("https://www.wikidata.org/w/api.php")
+            .get(WIKIDATA_API_URL)
             .query(&params)
             .send()
             .await?
@@ -1635,10 +1714,13 @@ impl WikiClient {
             .json()
             .await?;
 
-        Ok(response
+        let entity = response
             .entities
-            .get(wikidata_item)
-            .and_then(wikidata_commons_url_from_entity))
+            .get(&wikidata_item)
+            .cloned()
+            .context("Wikidata response did not include requested entity")?;
+        self.cache_put(cache_key, &entity, |cache| &mut cache.wikidata_entities);
+        Ok(entity)
     }
 
     async fn article_metadata_parts(
@@ -1709,6 +1791,198 @@ impl WikiClient {
             language_links: page.langlinks.unwrap_or_default(),
             pageviews,
         })
+    }
+
+    async fn wikidata_claims(&self, language: &str, item: &str) -> Result<WikidataClaims> {
+        let language =
+            normalize_language_code(language).context("Wikidata claims language is invalid")?;
+        let item = normalize_wikidata_entity_id(item).context("Wikidata item id is invalid")?;
+        let cache_key = format!("wikidata_claims:{language}:{item}");
+        if let Some(claims) = self.cache_get(&cache_key, |cache| &mut cache.wikidata_claims) {
+            return Ok(claims);
+        }
+
+        let entity = self.wikidata_entity(&item).await?;
+        let claims_by_property = entity.claims.clone().unwrap_or_default();
+        let mut label_ids = HashSet::from([item.clone()]);
+        for (property_id, claims) in &claims_by_property {
+            label_ids.insert(property_id.clone());
+            for claim in claims {
+                if let Some(entity_id) = wikidata_entity_id_from_snak(&claim.mainsnak)
+                    .and_then(|id| normalize_wikidata_entity_id(&id))
+                {
+                    label_ids.insert(entity_id);
+                }
+                if let Some(unit_id) = claim
+                    .mainsnak
+                    .datavalue
+                    .as_ref()
+                    .and_then(|datavalue| wikidata_quantity_unit_id(&datavalue.value))
+                {
+                    label_ids.insert(unit_id);
+                }
+            }
+        }
+
+        let labels = self
+            .wikidata_labels(&language, &label_ids.into_iter().collect::<Vec<_>>())
+            .await
+            .unwrap_or_else(|err| {
+                warn!(error = %err, item, "failed to fetch Wikidata labels");
+                HashMap::new()
+            });
+
+        let mut properties = claims_by_property
+            .into_iter()
+            .map(|(property_id, claims)| {
+                let property_label = wikidata_label_text(&labels, &property_id)
+                    .unwrap_or_else(|| property_id.clone());
+                let values = claims
+                    .iter()
+                    .filter_map(|claim| render_wikidata_snak_value(&claim.mainsnak, &labels))
+                    .take(WIKIDATA_VALUES_PER_PROPERTY_LIMIT)
+                    .collect::<Vec<_>>();
+                WikidataPropertyClaims {
+                    property_id,
+                    property_label,
+                    total_values: claims.len(),
+                    values,
+                }
+            })
+            .collect::<Vec<_>>();
+        properties.sort_by_key(|property| property.property_label.to_lowercase());
+
+        let claims = WikidataClaims {
+            item: item.clone(),
+            label: wikidata_label_text(&labels, &item)
+                .or_else(|| wikidata_localized_entity_value(entity.labels.as_ref(), &language)),
+            description: wikidata_description_text(&labels, &item).or_else(|| {
+                wikidata_localized_entity_value(entity.descriptions.as_ref(), &language)
+            }),
+            property_count: properties.len(),
+            properties,
+        };
+
+        self.cache_put(cache_key, &claims, |cache| &mut cache.wikidata_claims);
+        Ok(claims)
+    }
+
+    async fn wikidata_labels(
+        &self,
+        language: &str,
+        ids: &[String],
+    ) -> Result<HashMap<String, WikidataLabelInfo>> {
+        let mut unique_ids = ids
+            .iter()
+            .filter_map(|id| normalize_wikidata_entity_id(id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        unique_ids.sort();
+        if unique_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let cache_key = format!("wikidata_labels:{language}:{}", unique_ids.join("|"));
+        if let Some(labels) = self.cache_get(&cache_key, |cache| &mut cache.wikidata_labels) {
+            return Ok(labels);
+        }
+
+        let mut labels = HashMap::new();
+        for chunk in unique_ids.chunks(WIKIDATA_ENTITY_BATCH_SIZE) {
+            let params = vec![
+                ("action", "wbgetentities".to_string()),
+                ("format", "json".to_string()),
+                ("ids", chunk.join("|")),
+                ("props", "labels|descriptions".to_string()),
+                ("languages", format!("{language}|en")),
+                ("languagefallback", "1".to_string()),
+            ];
+
+            let response: WikidataEntitiesResponse = self
+                .http
+                .get(WIKIDATA_API_URL)
+                .query(&params)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            for (id, entity) in response.entities {
+                labels.insert(
+                    id,
+                    WikidataLabelInfo {
+                        label: wikidata_localized_entity_value(entity.labels.as_ref(), language),
+                        description: wikidata_localized_entity_value(
+                            entity.descriptions.as_ref(),
+                            language,
+                        ),
+                    },
+                );
+            }
+        }
+
+        self.cache_put(cache_key, &labels, |cache| &mut cache.wikidata_labels);
+        Ok(labels)
+    }
+
+    async fn wikidata_page_metadata(
+        &self,
+        item: &str,
+        revision_limit: usize,
+    ) -> Result<WikidataPageMetadata> {
+        let item = normalize_wikidata_entity_id(item).context("Wikidata item id is invalid")?;
+        let cache_key = format!("wikidata_page_metadata:{item}:{revision_limit}");
+        if let Some(metadata) =
+            self.cache_get(&cache_key, |cache| &mut cache.wikidata_page_metadata)
+        {
+            return Ok(metadata);
+        }
+
+        let params = vec![
+            ("action", "query".to_string()),
+            ("format", "json".to_string()),
+            ("formatversion", "2".to_string()),
+            ("prop", "info|revisions".to_string()),
+            ("titles", item.clone()),
+            ("inprop", "url".to_string()),
+            ("rvlimit", revision_limit.min(50).to_string()),
+            ("rvprop", "ids|timestamp|user|comment|size|tags".to_string()),
+            ("redirects", "1".to_string()),
+        ];
+
+        let response: InfoResponse = self
+            .http
+            .get(WIKIDATA_API_URL)
+            .query(&params)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let page = response
+            .query
+            .pages
+            .into_iter()
+            .next()
+            .context("Wikidata returned no page info")?;
+        let metadata = WikidataPageMetadata {
+            item: item.clone(),
+            page_id: page.pageid,
+            title: page.title,
+            full_url: page.fullurl,
+            length: page.length,
+            touched: page.touched,
+            last_revision_id: page.lastrevid,
+            revisions: page.revisions.unwrap_or_default(),
+        };
+
+        self.cache_put(cache_key, &metadata, |cache| {
+            &mut cache.wikidata_page_metadata
+        });
+        Ok(metadata)
     }
 
     async fn article_media(&self, language: &str, page_id: u64) -> Result<ArticleMedia> {
@@ -1861,6 +2135,10 @@ struct RamCache {
     article_categories: HashMap<String, CacheEntry<Vec<Category>>>,
     article_metadata: HashMap<String, CacheEntry<ArticleMetadata>>,
     article_media: HashMap<String, CacheEntry<ArticleMedia>>,
+    wikidata_entities: HashMap<String, CacheEntry<WikidataEntity>>,
+    wikidata_claims: HashMap<String, CacheEntry<WikidataClaims>>,
+    wikidata_labels: HashMap<String, CacheEntry<HashMap<String, WikidataLabelInfo>>>,
+    wikidata_page_metadata: HashMap<String, CacheEntry<WikidataPageMetadata>>,
 }
 
 #[derive(Clone)]
@@ -2348,6 +2626,10 @@ enum CallbackAction {
         page_id: u64,
         index: usize,
     },
+    Wikidata {
+        language: String,
+        item: String,
+    },
 }
 
 fn parse_callback_data(
@@ -2395,6 +2677,22 @@ fn parse_callback_data(
             page_id,
             index,
         });
+    }
+
+    if let Some(rest) = data.strip_prefix("wikidata:") {
+        let mut parts = rest.split(':');
+        let language = parts
+            .next()
+            .and_then(normalize_language_code)
+            .context("Wikidata callback has invalid language")?;
+        let item = parts
+            .next()
+            .and_then(normalize_wikidata_entity_id)
+            .context("Wikidata callback has invalid item id")?;
+        if parts.next().is_some() {
+            bail!("Wikidata callback has extra fields");
+        }
+        return Ok(CallbackAction::Wikidata { language, item });
     }
 
     if let Some(rest) = data.strip_prefix("category:") {
@@ -2697,6 +2995,45 @@ fn article_category_button_style(article_count: Option<usize>) -> Option<&'stati
         Some(count) if count > 10 => Some("danger"),
         _ => None,
     }
+}
+
+fn wikidata_metadata_keyboard(metadata: &ArticleMetadata) -> Option<Value> {
+    let item = metadata.info.page_props.get("wikibase_item")?;
+    let callback_data = wikidata_callback_data(&metadata.language, item)?;
+    let property_count = metadata.wikidata_property_count;
+    let mut button = json!({
+        "text": truncate_for_telegram(
+            &match property_count {
+                Some(count) => format!("Wikidata ({count} properties)"),
+                None => "Wikidata".to_string(),
+            },
+            TELEGRAM_MAX_BUTTON_TEXT
+        ),
+        "callback_data": callback_data,
+    });
+
+    if let Some(style) = wikidata_property_button_style(property_count) {
+        button
+            .as_object_mut()
+            .expect("button is a JSON object")
+            .insert("style".to_string(), Value::String(style.to_string()));
+    }
+
+    Some(json!({ "inline_keyboard": [[button]] }))
+}
+
+fn wikidata_property_button_style(property_count: Option<usize>) -> Option<&'static str> {
+    match property_count {
+        Some(count) if count < 5 => Some("primary"),
+        Some(count) if count > 10 => Some("danger"),
+        _ => None,
+    }
+}
+
+fn wikidata_callback_data(language: &str, item: &str) -> Option<String> {
+    let item = normalize_wikidata_entity_id(item)?;
+    let data = format!("wikidata:{language}:{item}");
+    (data.len() <= 64).then_some(data)
 }
 
 fn category_title_callback_data(language: &str, title: &str) -> Option<String> {
@@ -3751,6 +4088,354 @@ fn render_metadata_html(metadata: &ArticleMetadata) -> String {
     lines.join("\n")
 }
 
+fn render_wikidata_claims_html_parts(claims: &WikidataClaims, limit: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let title = claims
+        .label
+        .as_ref()
+        .map(|label| {
+            if label == &claims.item {
+                claims.item.clone()
+            } else {
+                format!("{label} ({})", claims.item)
+            }
+        })
+        .unwrap_or_else(|| claims.item.clone());
+    lines.push(html_bold_link(&wikidata_entity_url(&claims.item), &title));
+    if let Some(description) = claims.description.as_deref() {
+        lines.push(html_escape_text(description));
+    }
+    lines.push(format!("Properties: {}", claims.property_count));
+
+    for property in claims
+        .properties
+        .iter()
+        .take(WIKIDATA_PROPERTY_DISPLAY_LIMIT)
+    {
+        let property_title = if property.property_label == property.property_id {
+            property.property_id.clone()
+        } else {
+            format!("{} ({})", property.property_label, property.property_id)
+        };
+        let property_link = html_link(&wikidata_entity_url(&property.property_id), &property_title);
+        let mut values = if property.values.is_empty() {
+            vec![html_escape_text("no value")]
+        } else {
+            property.values.clone()
+        };
+        if property.total_values > values.len() {
+            values.push(format!("+{} more", property.total_values - values.len()));
+        }
+        lines.push(format!("{property_link}: {}", values.join(", ")));
+    }
+
+    if claims.properties.len() > WIKIDATA_PROPERTY_DISPLAY_LIMIT {
+        lines.push(format!(
+            "Shown first {} properties.",
+            WIKIDATA_PROPERTY_DISPLAY_LIMIT
+        ));
+    }
+
+    split_html_lines_for_telegram(&lines.join("\n"), limit)
+}
+
+fn render_wikidata_page_metadata_html(metadata: &WikidataPageMetadata) -> String {
+    let mut lines = Vec::new();
+    lines.push(html_bold(&format!(
+        "Wikidata metadata for {}",
+        metadata.item
+    )));
+    lines.push(format!(
+        "Info page: {}",
+        html_link(&wikidata_action_info_url(&metadata.item), "action=info")
+    ));
+    if let Some(page_id) = metadata.page_id {
+        lines.push(format!("Page ID: {page_id}"));
+    }
+    lines.push(format!("Title: {}", html_escape_text(&metadata.title)));
+    if let Some(length) = metadata.length {
+        lines.push(format!("Length: {length} bytes"));
+    }
+    if let Some(last_revision_id) = metadata.last_revision_id {
+        lines.push(format!(
+            "Latest revision: {}",
+            wikidata_revision_link(last_revision_id)
+        ));
+    }
+    if let Some(touched) = &metadata.touched {
+        lines.push(format!("Touched: {}", html_escape_text(touched)));
+    }
+    if let Some(full_url) = &metadata.full_url {
+        lines.push(format!("URL: {}", html_link(full_url, full_url)));
+    }
+
+    if !metadata.revisions.is_empty() {
+        lines.push(html_bold("Last edits:"));
+        for revision in &metadata.revisions {
+            let comment = revision
+                .comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|comment| !comment.is_empty())
+                .unwrap_or("(no edit summary)");
+            let tags = revision
+                .tags
+                .as_ref()
+                .filter(|tags| !tags.is_empty())
+                .map(|tags| format!(" [{}]", html_escape_text(&tags.join(", "))))
+                .unwrap_or_default();
+            let revision_text = revision
+                .revid
+                .map(wikidata_revision_link)
+                .unwrap_or_else(|| "rev 0".to_string());
+            lines.push(format!(
+                "- {} | {} | {} | size {} | {}{}",
+                html_escape_text(revision.timestamp.as_deref().unwrap_or("unknown time")),
+                wikidata_user_link(revision.user.as_deref()),
+                revision_text,
+                revision
+                    .size
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                html_escape_text(&truncate_for_telegram(comment, 240)),
+                tags
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn render_wikidata_snak_value(
+    snak: &WikidataSnak,
+    labels: &HashMap<String, WikidataLabelInfo>,
+) -> Option<String> {
+    let Some(datavalue) = &snak.datavalue else {
+        return match snak.snaktype.as_deref() {
+            Some("somevalue") => Some(html_escape_text("some value")),
+            Some("novalue") => Some(html_escape_text("no value")),
+            _ => None,
+        };
+    };
+
+    if let Some(entity_id) = wikidata_entity_id_from_value(&datavalue.value) {
+        return Some(wikidata_entity_link(&entity_id, labels));
+    }
+
+    if let Some(value) = datavalue.value.as_str() {
+        if snak.datatype.as_deref() == Some("commonsMedia") {
+            return Some(html_link(&commons_file_url(value), value));
+        }
+        return if is_absolute_url(value) {
+            Some(html_link(value, value))
+        } else {
+            Some(html_escape_text(value))
+        };
+    }
+
+    if let Some(value) = datavalue.value.as_object() {
+        if let Some(rendered) = wikidata_coordinate_value(value) {
+            return Some(rendered);
+        }
+        if let Some(rendered) = wikidata_time_value(value) {
+            return Some(rendered);
+        }
+        if let Some(rendered) = wikidata_quantity_value(value, labels) {
+            return Some(rendered);
+        }
+        if let Some(rendered) = wikidata_monolingual_text_value(value) {
+            return Some(rendered);
+        }
+    }
+
+    Some(html_escape_text(&truncate_for_telegram(
+        &datavalue.value.to_string(),
+        240,
+    )))
+}
+
+fn wikidata_coordinate_value(value: &serde_json::Map<String, Value>) -> Option<String> {
+    let lat = value.get("latitude")?.as_f64()?;
+    let lon = value.get("longitude")?.as_f64()?;
+    Some(html_link(
+        &coordinate_url(lat, lon),
+        &format!("{lat}, {lon}"),
+    ))
+}
+
+fn wikidata_time_value(value: &serde_json::Map<String, Value>) -> Option<String> {
+    let raw = value.get("time")?.as_str()?;
+    let mut formatted = raw.trim_start_matches('+').to_string();
+    if let Some((date, _time)) = formatted.split_once('T') {
+        formatted = date.to_string();
+    }
+    while formatted.ends_with("-00") {
+        formatted.truncate(formatted.len().saturating_sub(3));
+    }
+    (!formatted.is_empty()).then(|| html_escape_text(&formatted))
+}
+
+fn wikidata_quantity_value(
+    value: &serde_json::Map<String, Value>,
+    labels: &HashMap<String, WikidataLabelInfo>,
+) -> Option<String> {
+    let amount = value.get("amount")?.as_str()?.trim_start_matches('+');
+    let Some(unit) = value.get("unit").and_then(Value::as_str) else {
+        return Some(html_escape_text(amount));
+    };
+    if unit == "1" {
+        return Some(html_escape_text(amount));
+    }
+
+    let unit = wikidata_entity_id_from_url(unit)
+        .map(|id| wikidata_entity_link(&id, labels))
+        .unwrap_or_else(|| html_link(unit, unit));
+    Some(format!("{} {}", html_escape_text(amount), unit))
+}
+
+fn wikidata_monolingual_text_value(value: &serde_json::Map<String, Value>) -> Option<String> {
+    let text = value.get("text")?.as_str()?;
+    let language = value.get("language").and_then(Value::as_str);
+    Some(match language {
+        Some(language) => format!(
+            "{} ({})",
+            html_escape_text(text),
+            html_escape_text(language)
+        ),
+        None => html_escape_text(text),
+    })
+}
+
+fn wikidata_entity_link(entity_id: &str, labels: &HashMap<String, WikidataLabelInfo>) -> String {
+    let text = wikidata_label_text(labels, entity_id)
+        .filter(|label| label != entity_id)
+        .map(|label| format!("{label} ({entity_id})"))
+        .unwrap_or_else(|| entity_id.to_string());
+    html_link(&wikidata_entity_url(entity_id), &text)
+}
+
+fn wikidata_label_text(
+    labels: &HashMap<String, WikidataLabelInfo>,
+    entity_id: &str,
+) -> Option<String> {
+    labels.get(entity_id).and_then(|label| label.label.clone())
+}
+
+fn wikidata_description_text(
+    labels: &HashMap<String, WikidataLabelInfo>,
+    entity_id: &str,
+) -> Option<String> {
+    labels
+        .get(entity_id)
+        .and_then(|label| label.description.clone())
+}
+
+fn wikidata_entity_id_from_snak(snak: &WikidataSnak) -> Option<String> {
+    snak.datavalue
+        .as_ref()
+        .and_then(|datavalue| wikidata_entity_id_from_value(&datavalue.value))
+}
+
+fn wikidata_entity_id_from_value(value: &Value) -> Option<String> {
+    if let Some(id) = value
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(normalize_wikidata_entity_id)
+    {
+        return Some(id);
+    }
+
+    let numeric_id = value.get("numeric-id")?.as_u64()?;
+    match value.get("entity-type").and_then(Value::as_str) {
+        Some("item") => Some(format!("Q{numeric_id}")),
+        Some("property") => Some(format!("P{numeric_id}")),
+        Some("lexeme") => Some(format!("L{numeric_id}")),
+        _ => None,
+    }
+}
+
+fn wikidata_quantity_unit_id(value: &Value) -> Option<String> {
+    value
+        .get("unit")
+        .and_then(Value::as_str)
+        .and_then(wikidata_entity_id_from_url)
+}
+
+fn wikidata_entity_id_from_url(url: &str) -> Option<String> {
+    url.rsplit('/')
+        .next()
+        .and_then(normalize_wikidata_entity_id)
+}
+
+fn wikidata_localized_entity_value(
+    values: Option<&HashMap<String, WikidataLocalizedValue>>,
+    language: &str,
+) -> Option<String> {
+    let values = values?;
+    values
+        .get(language)
+        .or_else(|| values.get("en"))
+        .or_else(|| values.values().next())
+        .map(|value| value.value.clone())
+}
+
+fn normalize_wikidata_entity_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    let mut chars = value.chars();
+    let prefix = chars.next()?.to_ascii_uppercase();
+    if !matches!(prefix, 'Q' | 'P' | 'L') {
+        return None;
+    }
+    let rest = chars.collect::<String>();
+    (!rest.is_empty() && rest.chars().all(|character| character.is_ascii_digit()))
+        .then(|| format!("{prefix}{rest}"))
+}
+
+fn wikidata_entity_url(entity_id: &str) -> String {
+    format!("https://www.wikidata.org/wiki/{entity_id}")
+}
+
+fn wikidata_action_info_url(item: &str) -> String {
+    format!("https://www.wikidata.org/w/index.php?title={item}&action=info")
+}
+
+fn wikidata_revision_link(revision_id: u64) -> String {
+    html_link(
+        &format!("https://www.wikidata.org/w/index.php?oldid={revision_id}"),
+        &format!("rev {revision_id}"),
+    )
+}
+
+fn wikidata_user_link(user: Option<&str>) -> String {
+    let Some(user) = user.map(str::trim).filter(|user| {
+        !user.is_empty() && !user.starts_with("http://") && !user.starts_with("https://")
+    }) else {
+        return html_escape_text("unknown editor");
+    };
+
+    html_link(
+        &format!(
+            "https://www.wikidata.org/wiki/User:{}",
+            urlencoding::encode(&user.replace(' ', "_"))
+        ),
+        user,
+    )
+}
+
+fn commons_file_url(file: &str) -> String {
+    let file = file.trim();
+    let title = if file.to_ascii_lowercase().starts_with("file:") {
+        file.to_string()
+    } else {
+        format!("File:{file}")
+    };
+    commons_title_url(&title)
+}
+
+fn is_absolute_url(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://")
+}
+
 fn revision_link(language: &str, revision_id: u64) -> String {
     html_link(
         &format!("https://{language}.wikipedia.org/w/index.php?oldid={revision_id}"),
@@ -4453,10 +5138,46 @@ struct ArticleMetadata {
     language: String,
     info: ArticleInfo,
     commons_url: Option<String>,
+    wikidata_property_count: Option<usize>,
     revisions: Vec<Revision>,
     external_links: Vec<String>,
     language_links: Vec<LanguageLink>,
     pageviews: PageViews,
+}
+
+#[derive(Debug, Clone)]
+struct WikidataClaims {
+    item: String,
+    label: Option<String>,
+    description: Option<String>,
+    property_count: usize,
+    properties: Vec<WikidataPropertyClaims>,
+}
+
+#[derive(Debug, Clone)]
+struct WikidataPropertyClaims {
+    property_id: String,
+    property_label: String,
+    total_values: usize,
+    values: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WikidataLabelInfo {
+    label: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WikidataPageMetadata {
+    item: String,
+    page_id: Option<u64>,
+    title: String,
+    full_url: Option<String>,
+    length: Option<usize>,
+    touched: Option<String>,
+    last_revision_id: Option<u64>,
+    revisions: Vec<Revision>,
 }
 
 struct ArticleMetadataParts {
@@ -4679,30 +5400,39 @@ struct WikidataEntitiesResponse {
     entities: HashMap<String, WikidataEntity>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WikidataEntity {
     sitelinks: Option<HashMap<String, WikidataSitelink>>,
     claims: Option<HashMap<String, Vec<WikidataClaim>>>,
+    labels: Option<HashMap<String, WikidataLocalizedValue>>,
+    descriptions: Option<HashMap<String, WikidataLocalizedValue>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WikidataSitelink {
     title: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WikidataClaim {
     mainsnak: WikidataSnak,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WikidataSnak {
+    datatype: Option<String>,
+    snaktype: Option<String>,
     datavalue: Option<WikidataDataValue>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WikidataDataValue {
     value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WikidataLocalizedValue {
+    value: String,
 }
 
 #[cfg(test)]
@@ -4770,8 +5500,29 @@ mod tests {
                 assert_eq!(page_id, 42);
                 assert_eq!(index, 3);
             }
-            CallbackAction::Article { .. } | CallbackAction::Category { .. } => {
+            CallbackAction::Article { .. }
+            | CallbackAction::Category { .. }
+            | CallbackAction::Wikidata { .. } => {
                 panic!("expected article category callback")
+            }
+        }
+    }
+
+    #[test]
+    fn wikidata_callback_round_trips_item() {
+        let data = wikidata_callback_data("en", "q686963").unwrap();
+        assert_eq!(data, "wikidata:en:Q686963");
+
+        let action = parse_callback_data(&data, &[]).unwrap();
+        match action {
+            CallbackAction::Wikidata { language, item } => {
+                assert_eq!(language, "en");
+                assert_eq!(item, "Q686963");
+            }
+            CallbackAction::Article { .. }
+            | CallbackAction::Category { .. }
+            | CallbackAction::ArticleCategory { .. } => {
+                panic!("expected Wikidata callback")
             }
         }
     }
@@ -4985,6 +5736,15 @@ mod tests {
         assert_eq!(rows[0][1]["style"], "danger");
         assert!(rows[1][0].get("style").is_none());
         assert!(rows[1][1].get("style").is_none());
+    }
+
+    #[test]
+    fn wikidata_metadata_button_uses_property_count_styles() {
+        assert_eq!(wikidata_property_button_style(Some(4)), Some("primary"));
+        assert_eq!(wikidata_property_button_style(Some(5)), None);
+        assert_eq!(wikidata_property_button_style(Some(10)), None);
+        assert_eq!(wikidata_property_button_style(Some(11)), Some("danger"));
+        assert_eq!(wikidata_property_button_style(None), None);
     }
 
     #[test]
@@ -5500,6 +6260,7 @@ mod tests {
             commons_url: Some(
                 "https://commons.wikimedia.org/wiki/Category:Example_category".to_string(),
             ),
+            wikidata_property_count: Some(12),
             info: ArticleInfo {
                 page_id: Some(1),
                 title: "Example".to_string(),
@@ -5547,16 +6308,25 @@ mod tests {
         assert!(rendered.contains("Latest daily views: 321 on 2026-06-04"));
         assert!(rendered.contains("Editor"));
         assert!(rendered.contains("copy edit"));
+
+        let keyboard = wikidata_metadata_keyboard(&metadata).unwrap();
+        let button = &keyboard["inline_keyboard"][0][0];
+        assert_eq!(button["callback_data"], "wikidata:en:Q42");
+        assert_eq!(button["style"], "danger");
     }
 
     #[test]
     fn wikidata_commons_url_falls_back_to_p373_category() {
         let entity = WikidataEntity {
             sitelinks: None,
+            labels: None,
+            descriptions: None,
             claims: Some(HashMap::from([(
                 "P373".to_string(),
                 vec![WikidataClaim {
                     mainsnak: WikidataSnak {
+                        datatype: Some("commonsMedia".to_string()),
+                        snaktype: Some("value".to_string()),
                         datavalue: Some(WikidataDataValue {
                             value: Value::String("Vostok 1".to_string()),
                         }),
@@ -5569,5 +6339,73 @@ mod tests {
             wikidata_commons_url_from_entity(&entity),
             Some("https://commons.wikimedia.org/wiki/Category:Vostok_1".to_string())
         );
+    }
+
+    #[test]
+    fn wikidata_claims_render_clickable_key_values() {
+        let claims = WikidataClaims {
+            item: "Q686963".to_string(),
+            label: Some("Armies of Exigo".to_string()),
+            description: Some("real-time strategy video game".to_string()),
+            property_count: 2,
+            properties: vec![
+                WikidataPropertyClaims {
+                    property_id: "P31".to_string(),
+                    property_label: "instance of".to_string(),
+                    total_values: 1,
+                    values: vec![html_link(
+                        "https://www.wikidata.org/wiki/Q7889",
+                        "video game (Q7889)",
+                    )],
+                },
+                WikidataPropertyClaims {
+                    property_id: "P577".to_string(),
+                    property_label: "publication date".to_string(),
+                    total_values: 1,
+                    values: vec![html_escape_text("2004-11-30")],
+                },
+            ],
+        };
+
+        let rendered = render_wikidata_claims_html_parts(&claims, 3900).join("\n\n");
+
+        assert!(rendered.contains(
+            "<b><a href=\"https://www.wikidata.org/wiki/Q686963\">Armies of Exigo (Q686963)</a></b>"
+        ));
+        assert!(rendered.contains(
+            "<a href=\"https://www.wikidata.org/wiki/P31\">instance of (P31)</a>: <a href=\"https://www.wikidata.org/wiki/Q7889\">video game (Q7889)</a>"
+        ));
+        assert!(rendered.contains("Properties: 2"));
+    }
+
+    #[test]
+    fn wikidata_page_metadata_renders_last_edits() {
+        let metadata = WikidataPageMetadata {
+            item: "Q686963".to_string(),
+            page_id: Some(123),
+            title: "Q686963".to_string(),
+            full_url: Some("https://www.wikidata.org/wiki/Q686963".to_string()),
+            length: Some(456),
+            touched: Some("2026-06-05T00:00:00Z".to_string()),
+            last_revision_id: Some(99),
+            revisions: vec![Revision {
+                revid: Some(99),
+                timestamp: Some("2026-06-05T00:00:00Z".to_string()),
+                user: Some("Editor".to_string()),
+                comment: Some("claim update".to_string()),
+                size: Some(456),
+                tags: None,
+            }],
+        };
+
+        let rendered = render_wikidata_page_metadata_html(&metadata);
+
+        assert!(rendered.contains("Wikidata metadata for Q686963"));
+        assert!(
+            rendered.contains("https://www.wikidata.org/w/index.php?title=Q686963&amp;action=info")
+        );
+        assert!(rendered.contains("https://www.wikidata.org/w/index.php?oldid=99"));
+        assert!(rendered.contains("https://www.wikidata.org/wiki/User:Editor"));
+        assert!(rendered.contains("claim update"));
     }
 }
