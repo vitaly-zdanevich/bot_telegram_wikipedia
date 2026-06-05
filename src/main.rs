@@ -1399,7 +1399,7 @@ impl WikiClient {
             title,
             extract,
             length,
-            infobox: extract_infobox_text(&html),
+            infobox: extract_infobox_text(language, &html),
             infobox_image: extract_infobox_image(&html),
             body_html,
             references_html: mediawiki_references_to_telegram_html(language, &html),
@@ -2871,13 +2871,16 @@ fn render_navigation_heading_html(template: &NavTemplateButtons) -> String {
 }
 
 fn render_infobox_html(infobox: &str, limit: usize) -> String {
-    truncate_for_telegram(infobox, limit)
+    split_html_lines_for_telegram(infobox, limit)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
         .lines()
         .map(|line| {
             let line = line.trim();
             parse_coordinate_pair(line)
                 .map(|(lat, lon)| html_link(&coordinate_url(lat, lon), line))
-                .unwrap_or_else(|| html_escape_text(line))
+                .unwrap_or_else(|| line.to_string())
         })
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
@@ -4047,8 +4050,8 @@ fn truncate_for_telegram(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn extract_infobox_text(html: &str) -> Option<String> {
-    let text = extract_infobox_text_from_dom(html).or_else(|| {
+fn extract_infobox_text(language: &str, html: &str) -> Option<String> {
+    let text = extract_infobox_text_from_dom(language, html).or_else(|| {
         let re = INFOBOX_TABLE_RE.get_or_init(|| {
             Regex::new(r#"(?is)<table\b[^>]*class\s*=\s*["'][^"']*\binfobox\b[^"']*["'][^>]*>"#)
                 .expect("infobox regex is valid")
@@ -4056,12 +4059,18 @@ fn extract_infobox_text(html: &str) -> Option<String> {
         let table_match = re.find(html)?;
         let table_html =
             &html[table_match.start()..find_matching_table_end(html, table_match.start())?];
-        Some(clean_infobox_text(&html_to_text(table_html)))
+        let text = clean_infobox_text(&html_to_text(table_html));
+        Some(
+            text.lines()
+                .map(html_escape_text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     })?;
     (!text.is_empty()).then_some(text)
 }
 
-fn extract_infobox_text_from_dom(html: &str) -> Option<String> {
+fn extract_infobox_text_from_dom(language: &str, html: &str) -> Option<String> {
     let document = Html::parse_fragment(html);
     let infobox_selector = Selector::parse("table.infobox").expect("infobox selector is valid");
     let infobox = document.select(&infobox_selector).next()?;
@@ -4070,13 +4079,13 @@ fn extract_infobox_text_from_dom(html: &str) -> Option<String> {
 
     let lines = rows
         .into_iter()
-        .filter_map(render_infobox_row)
+        .filter_map(|row| render_infobox_row(language, row))
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-fn render_infobox_row(row: ElementRef<'_>) -> Option<String> {
+fn render_infobox_row(language: &str, row: ElementRef<'_>) -> Option<String> {
     if element_has_class_part(row, &["metadata", "navbox", "noprint"]) {
         return None;
     }
@@ -4097,26 +4106,36 @@ fn render_infobox_row(row: ElementRef<'_>) -> Option<String> {
                 ],
             )
         })
-        .map(|cell| (cell.value().name() == "th", infobox_cell_text(cell)))
+        .map(|cell| {
+            (
+                cell.value().name() == "th",
+                infobox_cell_html(language, cell),
+            )
+        })
         .filter(|(_, text)| !text.is_empty())
         .collect::<Vec<_>>();
 
     match cells.as_slice() {
         [] => None,
         [(is_header, text)] => {
-            if *is_header || is_meaningful_unlabeled_infobox_line(text) {
+            let plain = html_to_plain_text(text);
+            if *is_header || is_meaningful_unlabeled_infobox_line(&plain) {
                 Some(text.clone())
             } else {
                 None
             }
         }
         [(true, label), rest @ ..] => {
+            let label = html_to_plain_text(label);
+            let label = label.trim().trim_end_matches(':').trim();
             let value = rest
                 .iter()
                 .map(|(_, text)| text.as_str())
                 .collect::<Vec<_>>()
                 .join(" / ");
-            (!label.is_empty() && !value.is_empty()).then(|| format!("{label}: {value}"))
+            let value_is_empty = html_to_plain_text(&value).trim().is_empty();
+            (!label.is_empty() && !value_is_empty)
+                .then(|| format!("{}: {value}", html_escape_text(label)))
         }
         cells => {
             let text = cells
@@ -4124,13 +4143,13 @@ fn render_infobox_row(row: ElementRef<'_>) -> Option<String> {
                 .map(|(_, text)| text.as_str())
                 .collect::<Vec<_>>()
                 .join(" / ");
-            is_meaningful_unlabeled_infobox_line(&text).then_some(text)
+            is_meaningful_unlabeled_infobox_line(&html_to_plain_text(&text)).then_some(text)
         }
     }
 }
 
-fn infobox_cell_text(cell: ElementRef<'_>) -> String {
-    clean_infobox_text(&html_to_text(&cell.inner_html()))
+fn infobox_cell_html(language: &str, cell: ElementRef<'_>) -> String {
+    clean_infobox_text(&trim_html_spacing(&render_inline_element(language, cell)))
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -4211,10 +4230,12 @@ fn clean_infobox_text(text: &str) -> String {
     text.lines()
         .map(str::trim)
         .filter(|line| {
-            !line.is_empty()
-                && !is_empty_infobox_label(line)
-                && !is_infobox_map_caption(line)
-                && !is_infobox_sister_project_line(line)
+            let plain = html_to_plain_text(line);
+            let plain = plain.trim();
+            !plain.is_empty()
+                && !is_empty_infobox_label(plain)
+                && !is_infobox_map_caption(plain)
+                && !is_infobox_sister_project_line(plain)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -5060,6 +5081,7 @@ mod tests {
               <style>.mw-parser-output .locmap .od{position:absolute}</style>
               <tr><td><a href="/wiki/File:Flag.svg" title="File:Flag.svg"><img src="//upload.wikimedia.org/wikipedia/commons/thumb/a/a1/Flag.svg/320px-Flag.svg.png" alt="Flag" /></a></td></tr>
               <tr><th>Born</th><td>1 January 1900<sup>1</sup></td></tr>
+              <tr><th>Developer</th><td><a href="/wiki/Black_Hole_Entertainment">Black Hole Entertainment</a></td></tr>
               <tr><th>Location</th></tr>
               <tr><td>Interactive map of the Example area</td></tr>
               <tr><td>Show map of North Carolina Show map of the United States</td></tr>
@@ -5072,9 +5094,12 @@ mod tests {
             <p>Article body</p>
         "#;
 
-        let infobox = extract_infobox_text(html).unwrap();
+        let infobox = extract_infobox_text("en", html).unwrap();
         assert!(infobox.contains("Born"));
         assert!(infobox.contains("1 January 1900"));
+        assert!(infobox.contains(
+            "Developer: <a href=\"https://en.wikipedia.org/wiki/Black_Hole_Entertainment\">Black Hole Entertainment</a>"
+        ));
         assert!(infobox.contains("Occupation"));
         assert!(infobox.contains("Teacher"));
         assert!(infobox.contains("Стартовая площадка: 45°55′ с. ш. 63°20′ в. д."));
