@@ -45,6 +45,15 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install -y shellcheck
       - run: shellcheck scripts/*.sh
+      - name: Test favorite category helper
+        run: |
+          tmp="$(mktemp)"
+          TFVARS_FILE="$tmp" ./scripts/favorite-category.sh list | grep -F "No favorite categories configured."
+          TFVARS_FILE="$tmp" ./scripts/favorite-category.sh add en Physics
+          TFVARS_FILE="$tmp" ./scripts/favorite-category.sh add en Category:Mathematics
+          TFVARS_FILE="$tmp" ./scripts/favorite-category.sh remove en Physics
+          TFVARS_FILE="$tmp" ./scripts/favorite-category.sh list | grep -Fx "en:Category:Mathematics"
+          grep -Fx 'favorite_categories = "en:Category:Mathematics"' "$tmp"
 
   terraform:
     runs-on: ubuntu-latest

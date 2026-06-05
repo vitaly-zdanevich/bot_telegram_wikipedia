@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-PROJECT_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+PROJECT_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
 TFVARS_FILE="${TFVARS_FILE:-$PROJECT_ROOT/infra/terraform.tfvars}"
 
 usage() {
@@ -107,8 +107,12 @@ write_value() {
   if [[ -f "$TFVARS_FILE" ]] && grep -Eq '^[[:space:]]*favorite_categories[[:space:]]*=' "$TFVARS_FILE"; then
     sed -i -E "s|^[[:space:]]*favorite_categories[[:space:]]*=.*$|favorite_categories = \"$sed_value\"|" "$TFVARS_FILE"
   else
+    local needs_newline=false
+    if [[ -f "$TFVARS_FILE" && -s "$TFVARS_FILE" ]]; then
+      needs_newline=true
+    fi
     {
-      [[ ! -f "$TFVARS_FILE" || ! -s "$TFVARS_FILE" ]] || printf '\n'
+      $needs_newline && printf '\n'
       printf 'favorite_categories = "%s"\n' "$value"
     } >> "$TFVARS_FILE"
   fi
