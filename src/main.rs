@@ -32,6 +32,7 @@ const CATEGORY_BUTTON_LIMIT: usize = 12;
 const CATEGORY_SEARCH_FETCH_LIMIT: usize = 500;
 const NAV_TEMPLATE_LINK_LIMIT: usize = 30;
 const DISAMBIGUATION_LINK_LIMIT: usize = 30;
+const ARTICLE_BODY_LINK_LIMIT: usize = 20;
 const ARTICLE_TITLE_LOOKUP_LIMIT: usize = 50;
 const MEDIA_FILE_LOOKUP_LIMIT: usize = 50;
 const ARTICLE_IMAGE_GALLERY_LIMIT: usize = 10;
@@ -784,6 +785,7 @@ impl App {
             })?;
 
         let mut categories_task: Option<JoinHandle<Result<Vec<Category>>>> = None;
+        let mut body_links_task: Option<JoinHandle<Result<Vec<ArticleButton>>>> = None;
         let mut navigation_task: Option<JoinHandle<Result<Vec<NavTemplateButtons>>>> = None;
         let mut disambiguation_task: Option<JoinHandle<Result<Vec<ArticleButton>>>> = None;
         let mut metadata_task: Option<JoinHandle<Result<ArticleMetadata>>> = None;
@@ -798,6 +800,15 @@ impl App {
                     let language = language.clone();
                     async move { wiki.article_categories(&language, page_id).await }
                 }));
+
+                if !article.body_links.is_empty() {
+                    body_links_task = Some(spawn_wiki_task({
+                        let wiki = self.wiki.clone();
+                        let language = language.clone();
+                        let links = article.body_links.clone();
+                        async move { wiki.article_buttons_for_links(&language, &links).await }
+                    }));
+                }
 
                 if !article.nav_templates.is_empty() {
                     navigation_task = Some(spawn_wiki_task({
@@ -899,6 +910,30 @@ impl App {
                     }
                 }
                 Err(err) => warn!(error = %err, "failed to fetch navigation template links"),
+            }
+        }
+
+        if let Some(body_links_task) = body_links_task {
+            match join_task(body_links_task).await {
+                Ok(links) => {
+                    if !links.is_empty() {
+                        self.send_html_message(
+                            chat_id,
+                            &html_bold("Article links"),
+                            Some(json!({
+                                "inline_keyboard": article_results_keyboard(
+                                    &language,
+                                    &links,
+                                    self.config.big_article_char_threshold,
+                                    self.config.small_article_char_threshold,
+                                    false
+                                )
+                            })),
+                        )
+                        .await?;
+                    }
+                }
+                Err(err) => warn!(error = %err, "failed to fetch article body links"),
             }
         }
 
@@ -1767,6 +1802,11 @@ impl WikiClient {
         } else {
             Vec::new()
         };
+        let body_links = if is_disambiguation {
+            Vec::new()
+        } else {
+            mediawiki_body_links(language, &title, &html)
+        };
 
         Ok(ArticleContent {
             title,
@@ -1776,6 +1816,7 @@ impl WikiClient {
             infobox_image: extract_infobox_image(&html),
             body_html,
             references_html: mediawiki_references_to_telegram_html(language, &html),
+            body_links,
             nav_templates: mediawiki_nav_templates(language, &html),
             is_disambiguation,
             disambiguation_links,
@@ -4040,6 +4081,73 @@ fn mediawiki_disambiguation_links(language: &str, html: &str) -> Vec<NavLink> {
     links
 }
 
+fn mediawiki_body_links(language: &str, article_title: &str, html: &str) -> Vec<NavLink> {
+    let document = Html::parse_fragment(html);
+    let selector = Selector::parse("a[href]").expect("body link selector is valid");
+    let article_key = normalized_title_key(article_title);
+    let mut seen = HashSet::new();
+    let mut links = Vec::new();
+
+    for link in document.select(&selector) {
+        if element_has_class_part(link, &["selflink", "new"])
+            || element_or_ancestor_has_class_part(
+                link,
+                &[
+                    "infobox",
+                    "navbox",
+                    "vertical-navbox",
+                    "sidebar",
+                    "metadata",
+                    "sistersitebox",
+                    "selfreference",
+                    "reflist",
+                    "reference",
+                    "ambox",
+                    "hatnote",
+                    "noprint",
+                    "gallery",
+                    "portal",
+                    "mw-editsection",
+                    "mw-empty-elt",
+                ],
+            )
+        {
+            continue;
+        }
+
+        let Some(page_title) = link
+            .value()
+            .attr("href")
+            .and_then(wiki_article_title_from_href)
+        else {
+            continue;
+        };
+
+        let key = normalized_title_key(&page_title);
+        if key == article_key || !seen.insert(key) {
+            continue;
+        }
+
+        let label = trim_html_spacing(&render_inline_element(language, link));
+        let label = html_to_plain_text(&label);
+        let label = label.trim();
+        if label.is_empty() {
+            continue;
+        }
+
+        links.push(NavLink {
+            label: label.to_string(),
+            page_title,
+        });
+
+        if links.len() >= ARTICLE_BODY_LINK_LIMIT {
+            break;
+        }
+    }
+
+    links
+}
+
 fn mediawiki_nav_templates(language: &str, html: &str) -> Vec<NavTemplate> {
     let document = Html::parse_fragment(html);
     let selector =
@@ -5900,6 +6008,7 @@ struct ArticleContent {
     infobox_image: Option<MediaItem>,
     body_html: Option<String>,
     references_html: Option<String>,
+    body_links: Vec<NavLink>,
     nav_templates: Vec<NavTemplate>,
     is_disambiguation: bool,
     disambiguation_links: Vec<NavLink>,
@@ -6964,6 +7073,7 @@ mod tests {
                     .to_string(),
             ),
             references_html: None,
+            body_links: Vec::new(),
             nav_templates: Vec::new(),
             is_disambiguation: false,
             disambiguation_links: Vec::new(),
@@ -6995,6 +7105,7 @@ mod tests {
             infobox_image: None,
             body_html: Some([linked_line.as_str(); 10].join("\n")),
             references_html: None,
+            body_links: Vec::new(),
             nav_templates: Vec::new(),
             is_disambiguation: false,
             disambiguation_links: Vec::new(),
@@ -7043,6 +7154,37 @@ mod tests {
         ));
         assert!(!rendered.contains("[1]"));
         assert!(!rendered.contains("Reference text"));
+    }
+
+    #[test]
+    fn mediawiki_body_links_extracts_first_internal_body_links() {
+        let html = r#"
+            <table class="infobox"><tr><td><a href="/wiki/Infobox_Target">Infobox target</a></td></tr></table>
+            <p><b>Example</b> links to <a href="/wiki/First_Target">first target</a>,
+               <a href="/wiki/Second_Target">second target</a>,
+               <a href="/wiki/First_Target">duplicate first target</a>,
+               <a href="/wiki/Example">self target</a>,
+               <a class="new" href="/wiki/Missing_Target">missing target</a>,
+               and <a href="/wiki/Help:Contents">namespaced target</a>.</p>
+            <div class="navbox"><a href="/wiki/Nav_Target">Nav target</a></div>
+            <ol class="references"><li><a href="/wiki/Reference_Target">Reference target</a></li></ol>
+        "#;
+
+        let links = mediawiki_body_links("en", "Example", html);
+
+        assert_eq!(
+            links,
+            vec![
+                NavLink {
+                    label: "first target".to_string(),
+                    page_title: "First Target".to_string(),
+                },
+                NavLink {
+                    label: "second target".to_string(),
+                    page_title: "Second Target".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -7232,6 +7374,7 @@ mod tests {
             infobox_image: None,
             body_html: Some("This body must not be dumped.".to_string()),
             references_html: None,
+            body_links: Vec::new(),
             nav_templates: Vec::new(),
             is_disambiguation: true,
             disambiguation_links: mediawiki_disambiguation_links("en", html),
