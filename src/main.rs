@@ -754,8 +754,7 @@ impl App {
         if let Some(metadata_task) = metadata_task {
             match join_task(metadata_task).await {
                 Ok(metadata) => {
-                    let metadata_html =
-                        render_metadata_html(&metadata, self.config.message_char_limit);
+                    let metadata_html = render_metadata_html(&metadata);
                     for part in split_html_lines_for_telegram(
                         &metadata_html,
                         self.config.message_char_limit,
@@ -2751,7 +2750,7 @@ fn render_article_html_parts(
         .map(str::trim)
         .filter(|body| !body.is_empty())
     {
-        split_telegram_text(body_html, limit.saturating_sub(512).max(1))
+        split_html_lines_for_telegram(body_html, limit.saturating_sub(512).max(1))
     } else {
         let extract = article.extract.trim();
         let extract = if extract.is_empty() {
@@ -2906,7 +2905,7 @@ fn combine_html_sections(sections: Vec<String>, limit: usize) -> Vec<String> {
         }
 
         if section.chars().count() > limit {
-            parts.extend(split_telegram_text(&section, limit));
+            parts.extend(split_html_lines_for_telegram(&section, limit));
         } else {
             current = section;
         }
@@ -3611,7 +3610,7 @@ fn article_infobox_limit(article_length: Option<usize>) -> usize {
     }
 }
 
-fn render_metadata_html(metadata: &ArticleMetadata, limit: usize) -> String {
+fn render_metadata_html(metadata: &ArticleMetadata) -> String {
     let info = &metadata.info;
     let mut lines = Vec::new();
     lines.push(html_bold(&format!("Metadata for {}", info.title)));
@@ -3749,7 +3748,7 @@ fn render_metadata_html(metadata: &ArticleMetadata, limit: usize) -> String {
         }
     }
 
-    truncate_for_telegram(&lines.join("\n"), limit)
+    lines.join("\n")
 }
 
 fn revision_link(language: &str, revision_id: u64) -> String {
@@ -5156,6 +5155,33 @@ mod tests {
     }
 
     #[test]
+    fn article_html_splitting_does_not_break_links() {
+        let linked_line = format!(
+            "Start {} <a href=\"https://en.wikipedia.org/wiki/Linked_Article\">Linked Article</a> end.",
+            "word ".repeat(4)
+        );
+        let article = ArticleContent {
+            title: "Example".to_string(),
+            extract: String::new(),
+            length: Some(1000),
+            infobox: None,
+            infobox_image: None,
+            body_html: Some([linked_line.as_str(); 10].join("\n")),
+            references_html: None,
+            nav_templates: Vec::new(),
+            is_disambiguation: false,
+            disambiguation_links: Vec::new(),
+        };
+
+        let parts = render_article_html_parts("en", &article, 650);
+
+        assert!(parts.len() > 1);
+        for part in parts {
+            assert_eq!(part.matches("<a ").count(), part.matches("</a>").count());
+        }
+    }
+
+    #[test]
     fn mediawiki_html_preserves_inline_body_links_and_skips_refs() {
         let html = r#"
             <p><b>Rust</b> is a <a href="/wiki/Programming_language">programming language</a>.<sup class="reference">[1]</sup></p>
@@ -5508,7 +5534,7 @@ mod tests {
             },
         };
 
-        let rendered = render_metadata_html(&metadata, 3900);
+        let rendered = render_metadata_html(&metadata);
         assert!(rendered.contains("https://www.wikidata.org/wiki/Q42"));
         assert!(rendered.contains("https://commons.wikimedia.org/wiki/Category:Example_category"));
         assert!(rendered.contains("https://en.wikipedia.org/w/index.php?oldid=99"));
