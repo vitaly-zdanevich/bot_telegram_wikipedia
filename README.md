@@ -6,6 +6,8 @@ messages, and returning metadata/media after the article body.
 
 Code provenance: generated with an LLM, GPT-5.5 xhigh.
 
+Public bot: https://t.me/wikipedia_unofficial_bot
+
 ## Features
 
 - Search Wikipedia by message text and return article-title buttons.
@@ -102,7 +104,7 @@ graph TD
 
 ## Similar Bots
 
-These are useful reference points, not dependencies of this project.
+These are useful reference points, not dependencies of this project:
 
 | Project | Language | Notes |
 | --- | --- | --- |
