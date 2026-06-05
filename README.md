@@ -205,8 +205,9 @@ Every committed release change should update the package version in
 `Cargo.toml` and `Cargo.lock`, then create a matching git tag:
 
 ```bash
-git tag v0.0.2
-git push origin main v0.0.2
+version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+git tag "v$version"
+git push origin main "v$version"
 ```
 
 ## Deploy
