@@ -100,7 +100,13 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CURRENT_TARGET_RUSTFL
 
 echo "Building $BIN_NAME for $TARGET with target-cpu=$RUST_TARGET_CPU"
 
-"$CARGO_LAMBDA" lambda build \
+if "$CARGO_LAMBDA" build --help >/dev/null 2>&1; then
+  CARGO_LAMBDA_BUILD=(build)
+else
+  CARGO_LAMBDA_BUILD=(lambda build)
+fi
+
+"$CARGO_LAMBDA" "${CARGO_LAMBDA_BUILD[@]}" \
   --manifest-path "$ROOT_DIR/Cargo.toml" \
   --release \
   --arm64 \
