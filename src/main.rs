@@ -509,18 +509,18 @@ impl App {
                     )
                 })
         };
-        let description = async {
+        let overview = async {
             self.wiki
-                .category_description(language, title)
+                .category_overview(language, title)
                 .await
                 .with_context(|| {
                     format!(
-                        "failed to load category description for {title} from {language}.wikipedia.org"
+                        "failed to load category overview for {title} from {language}.wikipedia.org"
                     )
                 })
         };
-        let (articles, subcategories, description) =
-            tokio::try_join!(articles, subcategories, description)?;
+        let (articles, subcategories, overview) =
+            tokio::try_join!(articles, subcategories, overview)?;
         info!(
             language,
             title,
@@ -529,7 +529,8 @@ impl App {
             "loaded category members"
         );
 
-        if let Some(description) = description
+        if let Some(description) = overview
+            .description
             .as_deref()
             .map(str::trim)
             .filter(|description| !description.is_empty())
@@ -542,6 +543,15 @@ impl App {
             ) {
                 self.send_html_message(chat_id, &part, None).await?;
             }
+        }
+
+        if !overview.parent_categories.is_empty() {
+            self.send_html_message(
+                chat_id,
+                &render_parent_categories_html(language, title, &overview.parent_categories),
+                category_search_keyboard(language, &overview.parent_categories),
+            )
+            .await?;
         }
 
         if articles.is_empty() && subcategories.is_empty() {
@@ -1271,23 +1281,23 @@ impl WikiClient {
         Ok(categories)
     }
 
-    async fn category_description(&self, language: &str, title: &str) -> Result<Option<String>> {
+    async fn category_overview(&self, language: &str, title: &str) -> Result<CategoryOverview> {
         let normalized_title = normalize_category_title_for_language(title, language);
-        let cache_key = format!("category_description:{language}:{normalized_title}");
-        if let Some(description) =
-            self.cache_get(&cache_key, |cache| &mut cache.category_descriptions)
-        {
-            return Ok(description);
+        let cache_key = format!("category_overview:{language}:{normalized_title}");
+        if let Some(overview) = self.cache_get(&cache_key, |cache| &mut cache.category_overviews) {
+            return Ok(overview);
         }
 
         let params = vec![
             ("action", "query".to_string()),
             ("format", "json".to_string()),
             ("formatversion", "2".to_string()),
-            ("prop", "extracts".to_string()),
+            ("prop", "extracts|categories".to_string()),
             ("titles", normalized_title),
             ("exintro", "1".to_string()),
             ("explaintext", "1".to_string()),
+            ("cllimit", "max".to_string()),
+            ("clshow", "!hidden".to_string()),
             ("redirects", "1".to_string()),
         ];
 
@@ -1301,17 +1311,31 @@ impl WikiClient {
             .json()
             .await?;
 
-        let description = response
+        let page = response
             .query
             .pages
             .into_iter()
-            .find_map(|page| page.extract)
+            .next()
+            .context("Wikipedia returned no category page")?;
+        let description = page
+            .extract
             .map(|extract| extract.trim().to_string())
             .filter(|extract| !extract.is_empty());
-        self.cache_put(cache_key, &description, |cache| {
-            &mut cache.category_descriptions
-        });
-        Ok(description)
+        let parent_categories = page
+            .categories
+            .unwrap_or_default()
+            .into_iter()
+            .map(|category| Category {
+                title: normalize_category_title_for_language(&category.title, language),
+                article_count: None,
+            })
+            .collect::<Vec<_>>();
+        let overview = CategoryOverview {
+            description,
+            parent_categories,
+        };
+        self.cache_put(cache_key, &overview, |cache| &mut cache.category_overviews);
+        Ok(overview)
     }
 
     async fn article_content(&self, language: &str, page_id: u64) -> Result<ArticleContent> {
@@ -1833,7 +1857,7 @@ struct RamCache {
     category_search: HashMap<String, CacheEntry<Vec<Category>>>,
     category_articles: HashMap<String, CacheEntry<Vec<ArticleButton>>>,
     category_subcategories: HashMap<String, CacheEntry<Vec<Category>>>,
-    category_descriptions: HashMap<String, CacheEntry<Option<String>>>,
+    category_overviews: HashMap<String, CacheEntry<CategoryOverview>>,
     article_content: HashMap<String, CacheEntry<ArticleContent>>,
     article_categories: HashMap<String, CacheEntry<Vec<Category>>>,
     article_metadata: HashMap<String, CacheEntry<ArticleMetadata>>,
@@ -2758,8 +2782,29 @@ fn render_categories_html(language: &str, categories: &[Category]) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join(", ");
+        .join("\n");
     format!("{}\n{}", html_bold("Categories"), category_names)
+}
+
+fn render_parent_categories_html(language: &str, title: &str, categories: &[Category]) -> String {
+    let category_names = categories
+        .iter()
+        .map(|category| {
+            html_link(
+                &article_url(language, &category.title),
+                &category_display_title(&category.title),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n{}",
+        html_bold(&format!(
+            "Parent categories of {}",
+            normalize_category_title_for_language(title, language)
+        )),
+        category_names
+    )
 }
 
 fn render_category_search_html(language: &str, query: &str, categories: &[Category]) -> String {
@@ -4378,6 +4423,12 @@ struct Category {
 }
 
 #[derive(Debug, Clone)]
+struct CategoryOverview {
+    description: Option<String>,
+    parent_categories: Vec<Category>,
+}
+
+#[derive(Debug, Clone)]
 struct ArticleMetadata {
     language: String,
     info: ArticleInfo,
@@ -4509,6 +4560,7 @@ struct InfoPage {
     pageprops: Option<HashMap<String, String>>,
     coordinates: Option<Vec<Coordinate>>,
     categoryinfo: Option<CategoryInfoDto>,
+    categories: Option<Vec<CategoryDto>>,
     revisions: Option<Vec<Revision>>,
     extlinks: Option<Vec<ExternalLink>>,
     langlinks: Option<Vec<LanguageLink>>,
@@ -4546,6 +4598,11 @@ struct ExternalLink {
 struct LanguageLink {
     lang: String,
     langname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoryDto {
+    title: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5227,10 +5284,16 @@ mod tests {
     fn category_names_render_as_clickable_links() {
         let rendered = render_categories_html(
             "en",
-            &[Category {
-                title: "Category:Games".to_string(),
-                article_count: None,
-            }],
+            &[
+                Category {
+                    title: "Category:Games".to_string(),
+                    article_count: None,
+                },
+                Category {
+                    title: "Category:Video games".to_string(),
+                    article_count: None,
+                },
+            ],
         );
 
         assert!(rendered.contains("<b>Categories</b>"));
@@ -5238,6 +5301,32 @@ mod tests {
             rendered
                 .contains("<a href=\"https://en.wikipedia.org/wiki/Category%3AGames\">Games</a>")
         );
+        assert!(rendered.contains(
+            "Games</a>\n<a href=\"https://en.wikipedia.org/wiki/Category%3AVideo_games\">Video games</a>"
+        ));
+    }
+
+    #[test]
+    fn parent_categories_render_with_one_link_per_line() {
+        let rendered = render_parent_categories_html(
+            "en",
+            "Category:Linux games",
+            &[
+                Category {
+                    title: "Category:PC games".to_string(),
+                    article_count: None,
+                },
+                Category {
+                    title: "Category:Linux software".to_string(),
+                    article_count: None,
+                },
+            ],
+        );
+
+        assert!(rendered.contains("<b>Parent categories of Category:Linux games</b>"));
+        assert!(rendered.contains(
+            "PC games</a>\n<a href=\"https://en.wikipedia.org/wiki/Category%3ALinux_software\">Linux software</a>"
+        ));
     }
 
     #[test]
