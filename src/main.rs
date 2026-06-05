@@ -35,7 +35,9 @@ const CATEGORY_SUBCATEGORY_SCAN_PAGE_LIMIT: usize = 8;
 const NAV_TEMPLATE_LINK_LIMIT: usize = 30;
 const DISAMBIGUATION_LINK_LIMIT: usize = 30;
 const ARTICLE_TITLE_LOOKUP_LIMIT: usize = 50;
-const MEDIA_FILE_LOOKUP_LIMIT: usize = 30;
+const MEDIA_FILE_LOOKUP_LIMIT: usize = 50;
+const ARTICLE_IMAGE_GALLERY_LIMIT: usize = 10;
+const MIN_ICON_FILTER_SIDE_PX: u64 = 160;
 const INLINE_MESSAGE_CHAR_LIMIT: usize = 3900;
 const INLINE_CACHE_TIME_SECONDS: u32 = 0;
 const WIKIDATA_ENTITY_BATCH_SIZE: usize = 50;
@@ -129,6 +131,7 @@ struct Config {
     metadata_revision_limit: usize,
     http_timeout_seconds: u64,
     ram_cache_max_entries: usize,
+    article_images_button_only: bool,
 }
 
 impl Config {
@@ -175,6 +178,7 @@ impl Config {
                 "RAM_CACHE_MAX_ENTRIES",
                 DEFAULT_RAM_CACHE_MAX_ENTRIES,
             )?,
+            article_images_button_only: parse_bool_env("ARTICLE_IMAGES_BUTTON_ONLY", false)?,
         })
     }
 }
@@ -333,6 +337,12 @@ impl App {
                 self.answer_callback_query(&callback.id, "Loading Wikidata...", false)
                     .await?;
                 self.send_wikidata(chat_id, &language, &item).await?;
+            }
+            Ok(CallbackAction::Images { language, page_id }) => {
+                self.answer_callback_query(&callback.id, "Loading images...", false)
+                    .await?;
+                self.send_article_images(chat_id, &language, page_id)
+                    .await?;
             }
             Err(err) => {
                 warn!(error = %err, data, "ignored invalid callback data");
@@ -683,15 +693,6 @@ impl App {
             }
         }
 
-        if let Some(image) = &article.infobox_image {
-            self.send_media_item(
-                chat_id,
-                &format!("Infobox image for {}", article.title),
-                image,
-            )
-            .await?;
-        }
-
         if let Some(disambiguation_task) = disambiguation_task {
             match join_task(disambiguation_task).await {
                 Ok(links) => {
@@ -795,6 +796,8 @@ impl App {
                 Ok(media) => {
                     self.send_media(
                         chat_id,
+                        &language,
+                        page_id,
                         &article.title,
                         &media,
                         article.infobox_image.as_ref(),
@@ -854,15 +857,20 @@ impl App {
     async fn send_media(
         &self,
         chat_id: i64,
+        language: &str,
+        page_id: u64,
         title: &str,
         media: &ArticleMedia,
-        already_sent_image: Option<&MediaItem>,
+        infobox_image: Option<&MediaItem>,
     ) -> Result<()> {
-        if let Some(image) = &media.lead_image
-            && already_sent_image.is_none_or(|sent| sent.url != image.url)
-        {
-            self.send_media_item(chat_id, &format!("Image for {title}"), image)
-                .await?;
+        let images = article_gallery_images(media, infobox_image);
+        if self.config.article_images_button_only {
+            if let Some(keyboard) = article_images_keyboard(language, page_id, images.len()) {
+                self.send_html_message(chat_id, &html_bold("Article images"), Some(keyboard))
+                    .await?;
+            }
+        } else if !images.is_empty() {
+            self.send_image_gallery(chat_id, title, &images).await?;
         }
 
         if let Some(audio) = &media.audio {
@@ -884,6 +892,81 @@ impl App {
             {
                 warn!(error = %err, "failed to send article audio");
             }
+        }
+
+        Ok(())
+    }
+
+    async fn send_article_images(&self, chat_id: i64, language: &str, page_id: u64) -> Result<()> {
+        self.send_chat_action(chat_id, "upload_photo").await?;
+
+        let article = self.wiki.article_content(language, page_id);
+        let media = self.wiki.article_media(language, page_id);
+        let (article, media) = tokio::join!(article, media);
+        let article = article.with_context(|| {
+            format!("failed to fetch article page_id={page_id} from {language}")
+        })?;
+        let media = media.with_context(|| {
+            format!("failed to fetch article media page_id={page_id} from {language}")
+        })?;
+        let images = article_gallery_images(&media, article.infobox_image.as_ref());
+
+        if images.is_empty() {
+            self.send_message(chat_id, "No article images found.", None)
+                .await?;
+            return Ok(());
+        }
+
+        self.send_image_gallery(chat_id, &article.title, &images)
+            .await
+    }
+
+    async fn send_image_gallery(
+        &self,
+        chat_id: i64,
+        title: &str,
+        images: &[MediaItem],
+    ) -> Result<()> {
+        let images = images
+            .iter()
+            .take(ARTICLE_IMAGE_GALLERY_LIMIT)
+            .collect::<Vec<_>>();
+        if images.is_empty() {
+            return Ok(());
+        }
+
+        self.send_chat_action(chat_id, "upload_photo").await?;
+        let caption = format!("Images for {title}");
+        if images.len() == 1 {
+            return self.send_media_item(chat_id, &caption, images[0]).await;
+        }
+
+        let media = images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| {
+                let mut item = json!({
+                    "type": "photo",
+                    "media": image.url,
+                });
+                if index == 0 {
+                    item["caption"] = Value::String(truncate_for_telegram(&caption, 1024));
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+
+        if let Err(err) = self
+            .telegram_post(
+                "sendMediaGroup",
+                &json!({
+                    "chat_id": chat_id,
+                    "media": media,
+                }),
+            )
+            .await
+        {
+            warn!(error = %err, "failed to send article image gallery");
         }
 
         Ok(())
@@ -2122,7 +2205,10 @@ impl WikiClient {
                     .unwrap_or_else(|| "Lead image".to_string()),
                 url: thumbnail.source,
                 mime: None,
+                width: thumbnail.width,
+                height: thumbnail.height,
             }),
+            images: Vec::new(),
             audio: None,
         };
 
@@ -2131,7 +2217,7 @@ impl WikiClient {
             .unwrap_or_default()
             .into_iter()
             .map(|image| image.title)
-            .filter(|title| looks_like_image_or_audio(title))
+            .filter(|title| looks_like_image_or_audio(title) && !looks_like_icon_title(title))
             .take(MEDIA_FILE_LOOKUP_LIMIT)
             .collect::<Vec<_>>();
 
@@ -2153,6 +2239,19 @@ impl WikiClient {
                         .is_some_and(|mime| mime.starts_with("image/"))
                 })
                 .cloned();
+        }
+
+        if let Some(lead_image) = &media.lead_image
+            && is_gallery_image(lead_image)
+        {
+            push_unique_media_item(&mut media.images, lead_image.clone());
+        }
+
+        for image in file_infos.iter().filter(|item| is_gallery_image(item)) {
+            push_unique_media_item(&mut media.images, image.clone());
+            if media.images.len() >= ARTICLE_IMAGE_GALLERY_LIMIT {
+                break;
+            }
         }
 
         media.audio = file_infos.into_iter().find(|item| {
@@ -2195,6 +2294,8 @@ impl WikiClient {
                     title: page.title,
                     url: info.url,
                     mime: info.mime,
+                    width: info.width,
+                    height: info.height,
                 })
             })
             .collect())
@@ -2313,6 +2414,18 @@ where
             .parse::<T>()
             .with_context(|| format!("{key} has invalid value {value:?}")),
         None => Ok(default),
+    }
+}
+
+fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
+    let Some(value) = optional_env(key) else {
+        return Ok(default);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{key} must be one of true/false, yes/no, on/off, or 1/0"),
     }
 }
 
@@ -2724,6 +2837,10 @@ enum CallbackAction {
         language: String,
         item: String,
     },
+    Images {
+        language: String,
+        page_id: u64,
+    },
 }
 
 fn parse_callback_data(
@@ -2787,6 +2904,23 @@ fn parse_callback_data(
             bail!("Wikidata callback has extra fields");
         }
         return Ok(CallbackAction::Wikidata { language, item });
+    }
+
+    if let Some(rest) = data.strip_prefix("images:") {
+        let mut parts = rest.split(':');
+        let language = parts
+            .next()
+            .and_then(normalize_language_code)
+            .context("images callback has invalid language")?;
+        let page_id = parts
+            .next()
+            .context("images callback has no page id")?
+            .parse::<u64>()
+            .context("images callback page id is invalid")?;
+        if parts.next().is_some() {
+            bail!("images callback has extra fields");
+        }
+        return Ok(CallbackAction::Images { language, page_id });
     }
 
     if let Some(rest) = data.strip_prefix("category:") {
@@ -3127,6 +3261,29 @@ fn wikidata_property_button_style(property_count: Option<usize>) -> Option<&'sta
 fn wikidata_callback_data(language: &str, item: &str) -> Option<String> {
     let item = normalize_wikidata_entity_id(item)?;
     let data = format!("wikidata:{language}:{item}");
+    (data.len() <= 64).then_some(data)
+}
+
+fn article_images_keyboard(language: &str, page_id: u64, image_count: usize) -> Option<Value> {
+    if image_count == 0 {
+        return None;
+    }
+
+    let callback_data = article_images_callback_data(language, page_id)?;
+    let button = json!({
+        "text": truncate_for_telegram(
+            &format!("Images ({})", image_count.min(ARTICLE_IMAGE_GALLERY_LIMIT)),
+            TELEGRAM_MAX_BUTTON_TEXT
+        ),
+        "callback_data": callback_data,
+    });
+
+    Some(json!({ "inline_keyboard": [[button]] }))
+}
+
+fn article_images_callback_data(language: &str, page_id: u64) -> Option<String> {
+    let language = normalize_language_code(language)?;
+    let data = format!("images:{language}:{page_id}");
     (data.len() <= 64).then_some(data)
 }
 
@@ -5015,6 +5172,8 @@ fn extract_infobox_image(html: &str) -> Option<MediaItem> {
                 title,
                 url: src,
                 mime: None,
+                width: None,
+                height: None,
             });
         }
     }
@@ -5172,6 +5331,103 @@ fn looks_like_image_or_audio(title: &str) -> bool {
         || title.ends_with(".mp3")
         || title.ends_with(".wav")
         || title.ends_with(".flac")
+}
+
+fn is_gallery_image(item: &MediaItem) -> bool {
+    let is_image = item
+        .mime
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("image/"))
+        || looks_like_image_url(&item.url);
+    is_image && !looks_like_icon_media_item(item)
+}
+
+fn article_gallery_images(
+    media: &ArticleMedia,
+    infobox_image: Option<&MediaItem>,
+) -> Vec<MediaItem> {
+    let mut images = Vec::new();
+    if let Some(image) = infobox_image.filter(|image| is_gallery_image(image)) {
+        push_unique_media_item(&mut images, image.clone());
+    }
+    if let Some(image) = media
+        .lead_image
+        .as_ref()
+        .filter(|image| is_gallery_image(image))
+    {
+        push_unique_media_item(&mut images, image.clone());
+    }
+    for image in media.images.iter().filter(|image| is_gallery_image(image)) {
+        push_unique_media_item(&mut images, image.clone());
+        if images.len() >= ARTICLE_IMAGE_GALLERY_LIMIT {
+            break;
+        }
+    }
+    images.truncate(ARTICLE_IMAGE_GALLERY_LIMIT);
+    images
+}
+
+fn looks_like_icon_media_item(item: &MediaItem) -> bool {
+    looks_like_icon_title(&item.title)
+        || looks_like_icon_title(&item.url)
+        || item.width.zip(item.height).is_some_and(|(width, height)| {
+            width < MIN_ICON_FILTER_SIDE_PX && height < MIN_ICON_FILTER_SIDE_PX
+        })
+}
+
+fn looks_like_icon_title(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase().replace([' ', '-'], "_");
+    [
+        "ambox",
+        "commons_logo",
+        "crystal_clear",
+        "edit_icon",
+        "gnome_",
+        "icon",
+        "map_marker",
+        "nuvola",
+        "oojs_ui",
+        "question_book",
+        "sound_icon",
+        "speaker_icon",
+        "stub",
+        "symbol",
+        "wikidata",
+        "wikimedia_logo",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn push_unique_media_item(items: &mut Vec<MediaItem>, item: MediaItem) {
+    if !items
+        .iter()
+        .any(|existing| media_items_match(existing, &item))
+    {
+        items.push(item);
+    }
+}
+
+fn media_items_match(left: &MediaItem, right: &MediaItem) -> bool {
+    left.url == right.url
+        || normalized_media_title(&left.title) == normalized_media_title(&right.title)
+}
+
+fn normalized_media_title(title: &str) -> String {
+    let title = title.trim();
+    let title = title
+        .strip_prefix("File:")
+        .or_else(|| title.strip_prefix("file:"))
+        .or_else(|| title.strip_prefix("Файл:"))
+        .or_else(|| title.strip_prefix("файл:"))
+        .unwrap_or(title);
+    title
+        .trim()
+        .replace('_', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5346,6 +5602,7 @@ struct ArticleInfo {
 #[derive(Debug, Clone)]
 struct ArticleMedia {
     lead_image: Option<MediaItem>,
+    images: Vec<MediaItem>,
     audio: Option<MediaItem>,
 }
 
@@ -5354,6 +5611,8 @@ struct MediaItem {
     title: String,
     url: String,
     mime: Option<String>,
+    width: Option<u64>,
+    height: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5502,6 +5761,8 @@ struct PageMediaPage {
 #[derive(Debug, Deserialize)]
 struct Thumbnail {
     source: String,
+    width: Option<u64>,
+    height: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5529,6 +5790,8 @@ struct ImageInfoPage {
 struct ImageInfo {
     url: String,
     mime: Option<String>,
+    width: Option<u64>,
+    height: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5638,7 +5901,8 @@ mod tests {
             }
             CallbackAction::Article { .. }
             | CallbackAction::Category { .. }
-            | CallbackAction::Wikidata { .. } => {
+            | CallbackAction::Wikidata { .. }
+            | CallbackAction::Images { .. } => {
                 panic!("expected article category callback")
             }
         }
@@ -5657,10 +5921,93 @@ mod tests {
             }
             CallbackAction::Article { .. }
             | CallbackAction::Category { .. }
-            | CallbackAction::ArticleCategory { .. } => {
+            | CallbackAction::ArticleCategory { .. }
+            | CallbackAction::Images { .. } => {
                 panic!("expected Wikidata callback")
             }
         }
+    }
+
+    #[test]
+    fn article_images_callback_round_trips_page_id() {
+        let data = article_images_callback_data("EN", 12345).unwrap();
+        assert_eq!(data, "images:en:12345");
+
+        let action = parse_callback_data(&data, &[]).unwrap();
+        match action {
+            CallbackAction::Images { language, page_id } => {
+                assert_eq!(language, "en");
+                assert_eq!(page_id, 12345);
+            }
+            CallbackAction::Article { .. }
+            | CallbackAction::Category { .. }
+            | CallbackAction::ArticleCategory { .. }
+            | CallbackAction::Wikidata { .. } => {
+                panic!("expected article images callback")
+            }
+        }
+    }
+
+    #[test]
+    fn article_gallery_images_dedupe_filter_icons_and_cap_to_ten() {
+        let infobox = MediaItem {
+            title: "File:Lead.jpg".to_string(),
+            url: "https://upload.wikimedia.org/lead.jpg".to_string(),
+            mime: Some("image/jpeg".to_string()),
+            width: Some(1200),
+            height: Some(800),
+        };
+        let lead_duplicate = MediaItem {
+            title: "Lead.jpg".to_string(),
+            url: "https://upload.wikimedia.org/lead-thumbnail.jpg".to_string(),
+            mime: Some("image/jpeg".to_string()),
+            width: Some(640),
+            height: Some(480),
+        };
+        let icon = MediaItem {
+            title: "File:OOjs UI icon edit.svg".to_string(),
+            url: "https://upload.wikimedia.org/icon.svg".to_string(),
+            mime: Some("image/svg+xml".to_string()),
+            width: Some(20),
+            height: Some(20),
+        };
+        let mut images = vec![lead_duplicate.clone(), icon];
+        for index in 0..12 {
+            images.push(MediaItem {
+                title: format!("File:Photo {index}.jpg"),
+                url: format!("https://upload.wikimedia.org/photo-{index}.jpg"),
+                mime: Some("image/jpeg".to_string()),
+                width: Some(1000),
+                height: Some(700),
+            });
+        }
+        let media = ArticleMedia {
+            lead_image: Some(lead_duplicate),
+            images,
+            audio: None,
+        };
+
+        let gallery = article_gallery_images(&media, Some(&infobox));
+
+        assert_eq!(gallery.len(), ARTICLE_IMAGE_GALLERY_LIMIT);
+        assert_eq!(gallery[0].title, "File:Lead.jpg");
+        assert!(!gallery.iter().any(|image| image.title.contains("OOjs")));
+        assert_eq!(
+            gallery
+                .iter()
+                .filter(|image| normalized_media_title(&image.title) == "lead.jpg")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn article_images_keyboard_uses_image_callback() {
+        let keyboard = article_images_keyboard("en", 42, 12).unwrap();
+        let button = &keyboard["inline_keyboard"][0][0];
+
+        assert_eq!(button["text"], "Images (10)");
+        assert_eq!(button["callback_data"], "images:en:42");
     }
 
     #[test]

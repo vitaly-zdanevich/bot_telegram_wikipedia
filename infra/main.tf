@@ -56,6 +56,7 @@ resource "aws_lambda_function" "bot" {
       METADATA_REVISION_LIMIT        = tostring(var.metadata_revision_limit)
       WIKIPEDIA_HTTP_TIMEOUT_SECONDS = tostring(var.wikipedia_http_timeout_seconds)
       RAM_CACHE_MAX_ENTRIES          = tostring(var.ram_cache_max_entries)
+      ARTICLE_IMAGES_BUTTON_ONLY     = tostring(var.article_images_button_only)
       RUST_LOG                       = "telegram_wikipedia_bot=info"
     }
   }

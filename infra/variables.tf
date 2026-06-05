@@ -88,6 +88,12 @@ variable "ram_cache_max_entries" {
   default     = 512
 }
 
+variable "article_images_button_only" {
+  type        = bool
+  description = "When true, article images are offered as an Images button instead of being sent automatically."
+  default     = false
+}
+
 variable "memory_size_mb" {
   type        = number
   description = "Lambda memory. This account currently accepts up to 3008 MB in us-east-1; raise to 10240 after AWS allows the newer maximum."

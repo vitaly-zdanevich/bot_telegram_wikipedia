@@ -23,8 +23,9 @@ Public bot: https://t.me/wikipedia_unofficial_bot
 - Force a wiki with `lang:<code> query`, for example `lang:fr Albert Camus`.
 - Fetch article text with the infobox at the top when Wikipedia exposes an
   `infobox` table in parsed HTML.
-- Send the first useful infobox image directly from the parsed article HTML when
-  Wikipedia exposes one.
+- Send up to 10 article images as a separate Telegram media group by default,
+  with icon-like files filtered out. Set `ARTICLE_IMAGES_BUTTON_ONLY=true` to
+  replace the automatic gallery with an `Images (N)` button.
 - Render article and metadata headers in bold. Article section headers link to
   their Wikipedia section anchors.
 - Preserve normal clickable internal Wikipedia links inside the article body.
@@ -48,8 +49,7 @@ Public bot: https://t.me/wikipedia_unofficial_bot
   Wikimedia Commons, coordinates, 30-day pageviews, language-link count,
   external links, and clickable last edits/usernames with timestamps and edit
   summaries.
-- Send a lead image and first detected audio file when Wikipedia exposes usable
-  media URLs.
+- Send the first detected audio file when Wikipedia exposes a usable media URL.
 - Keep a bounded local RAM cache inside warm Lambda execution environments for
   searches, category listings, article content, metadata, categories, and media.
   There is no TTL; entries live until the warm Lambda environment is recycled or
@@ -94,10 +94,10 @@ graph TD
     I --> J[Fetch parsed article HTML from Wikimedia]
     J --> K[Send first article message fast]
     K --> L[Send remaining article parts and references]
-    K --> M[Fetch categories, metadata, image and audio in parallel]
+    K --> M[Fetch categories, metadata, image gallery and audio in parallel]
     M --> N[Send category buttons]
     N --> O[Send metadata]
-    O --> P[Send image and audio when available]
+    O --> P[Send image gallery or Images button, plus audio when available]
     C -- Category alias --> Q[Search matching categories]
     Q --> R[Send clickable category names and category buttons]
     C -- Category button --> U[Load subcategories and newest pages in parallel]
@@ -139,6 +139,8 @@ Optional Lambda environment:
 - `WIKIPEDIA_HTTP_TIMEOUT_SECONDS`: default `20`.
 - `RAM_CACHE_MAX_ENTRIES`: default `512` entries per cache namespace. Set `0`
   to disable local RAM cache.
+- `ARTICLE_IMAGES_BUTTON_ONLY`: default `false`. When `true`, article images are
+  offered through an `Images (N)` button instead of being sent automatically.
 
 ## Build
 
