@@ -8,6 +8,10 @@ Code provenance: generated with an LLM, GPT-5.5 xhigh.
 
 Public bot: https://t.me/wikipedia_unofficial_bot
 
+## Screenshot
+
+![Telegram chat with the bot showing Wikipedia search results and an article response](docs/screenshot.webp)
+
 ## Features
 
 - Search Wikipedia by message text and return article-title buttons.
