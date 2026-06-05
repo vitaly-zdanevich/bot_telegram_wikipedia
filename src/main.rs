@@ -746,8 +746,10 @@ impl App {
                 Ok(metadata) => {
                     let metadata_html =
                         render_metadata_html(&metadata, self.config.message_char_limit);
-                    for part in split_telegram_text(&metadata_html, self.config.message_char_limit)
-                    {
+                    for part in split_html_lines_for_telegram(
+                        &metadata_html,
+                        self.config.message_char_limit,
+                    ) {
                         self.send_html_message(chat_id, &part, None).await?;
                     }
                 }
@@ -1560,20 +1562,13 @@ impl WikiClient {
             return Ok(metadata);
         }
 
-        let info = self.article_info(language, page_id);
-        let revisions = self.article_revisions(language, page_id, revision_limit);
-        let external_links = self.article_external_links(language, page_id);
-        let language_links = self.article_language_links(language, page_id);
-        let pageviews = self.article_pageviews(language, page_id);
-
-        let (info, revisions, external_links, language_links, pageviews) =
-            tokio::join!(info, revisions, external_links, language_links, pageviews);
-
-        let info = info?;
-        let commons_url = match commons_page_url(&info.page_props) {
+        let parts = self
+            .article_metadata_parts(language, page_id, revision_limit)
+            .await?;
+        let commons_url = match commons_page_url(&parts.info.page_props) {
             Some(url) => Some(url),
             None => {
-                if let Some(wikidata_item) = info.page_props.get("wikibase_item") {
+                if let Some(wikidata_item) = parts.info.page_props.get("wikibase_item") {
                     self.wikidata_commons_url(wikidata_item)
                         .await
                         .unwrap_or_else(|err| {
@@ -1587,24 +1582,12 @@ impl WikiClient {
         };
         let metadata = ArticleMetadata {
             language: language.to_string(),
-            info,
+            info: parts.info,
             commons_url,
-            revisions: revisions.unwrap_or_else(|err| {
-                warn!(error = %err, "failed to fetch revisions");
-                Vec::new()
-            }),
-            external_links: external_links.unwrap_or_else(|err| {
-                warn!(error = %err, "failed to fetch external links");
-                Vec::new()
-            }),
-            language_links: language_links.unwrap_or_else(|err| {
-                warn!(error = %err, "failed to fetch language links");
-                Vec::new()
-            }),
-            pageviews: pageviews.unwrap_or_else(|err| {
-                warn!(error = %err, "failed to fetch pageviews");
-                PageViews::default()
-            }),
+            revisions: parts.revisions,
+            external_links: parts.external_links,
+            language_links: parts.language_links,
+            pageviews: parts.pageviews,
         };
         self.cache_put(cache_key, &metadata, |cache| &mut cache.article_metadata);
         Ok(metadata)
@@ -1635,15 +1618,29 @@ impl WikiClient {
             .and_then(wikidata_commons_url_from_entity))
     }
 
-    async fn article_info(&self, language: &str, page_id: u64) -> Result<ArticleInfo> {
+    async fn article_metadata_parts(
+        &self,
+        language: &str,
+        page_id: u64,
+        revision_limit: usize,
+    ) -> Result<ArticleMetadataParts> {
         let params = vec![
             ("action", "query".to_string()),
             ("format", "json".to_string()),
             ("formatversion", "2".to_string()),
-            ("prop", "info|pageprops|coordinates".to_string()),
+            (
+                "prop",
+                "info|pageprops|coordinates|revisions|extlinks|langlinks|pageviews".to_string(),
+            ),
             ("pageids", page_id.to_string()),
             ("inprop", "url".to_string()),
             ("coprop", "type|name|dim|country|region|globe".to_string()),
+            ("rvlimit", revision_limit.min(50).to_string()),
+            ("rvprop", "ids|timestamp|user|comment|size|tags".to_string()),
+            ("ellimit", "max".to_string()),
+            ("lllimit", "max".to_string()),
+            ("llprop", "url|langname".to_string()),
+            ("pvipdays", "30".to_string()),
             ("redirects", "1".to_string()),
         ];
 
@@ -1664,7 +1661,8 @@ impl WikiClient {
             .next()
             .context("Wikipedia returned no page info")?;
 
-        Ok(ArticleInfo {
+        let pageviews = pageviews_from_map(page.pageviews);
+        let info = ArticleInfo {
             page_id: page.pageid,
             title: page.title,
             full_url: page.fullurl,
@@ -1673,149 +1671,20 @@ impl WikiClient {
             last_revision_id: page.lastrevid,
             page_props: page.pageprops.unwrap_or_default(),
             coordinates: page.coordinates.unwrap_or_default(),
-        })
-    }
-
-    async fn article_revisions(
-        &self,
-        language: &str,
-        page_id: u64,
-        limit: usize,
-    ) -> Result<Vec<Revision>> {
-        let params = vec![
-            ("action", "query".to_string()),
-            ("format", "json".to_string()),
-            ("formatversion", "2".to_string()),
-            ("prop", "revisions".to_string()),
-            ("pageids", page_id.to_string()),
-            ("rvlimit", limit.min(50).to_string()),
-            ("rvprop", "ids|timestamp|user|comment|size|tags".to_string()),
-            ("redirects", "1".to_string()),
-        ];
-
-        let response: RevisionsResponse = self
-            .http
-            .get(wiki_api_url(language)?)
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        Ok(response
-            .query
-            .pages
-            .into_iter()
-            .next()
-            .and_then(|page| page.revisions)
-            .unwrap_or_default())
-    }
-
-    async fn article_external_links(&self, language: &str, page_id: u64) -> Result<Vec<String>> {
-        let params = vec![
-            ("action", "query".to_string()),
-            ("format", "json".to_string()),
-            ("formatversion", "2".to_string()),
-            ("prop", "extlinks".to_string()),
-            ("pageids", page_id.to_string()),
-            ("ellimit", "max".to_string()),
-            ("redirects", "1".to_string()),
-        ];
-
-        let response: ExternalLinksResponse = self
-            .http
-            .get(wiki_api_url(language)?)
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        Ok(response
-            .query
-            .pages
-            .into_iter()
-            .next()
-            .and_then(|page| page.extlinks)
+        };
+        let external_links = page
+            .extlinks
             .unwrap_or_default()
             .into_iter()
             .filter_map(|link| link.url)
-            .collect())
-    }
+            .collect::<Vec<_>>();
 
-    async fn article_language_links(
-        &self,
-        language: &str,
-        page_id: u64,
-    ) -> Result<Vec<LanguageLink>> {
-        let params = vec![
-            ("action", "query".to_string()),
-            ("format", "json".to_string()),
-            ("formatversion", "2".to_string()),
-            ("prop", "langlinks".to_string()),
-            ("pageids", page_id.to_string()),
-            ("lllimit", "max".to_string()),
-            ("llprop", "url|langname".to_string()),
-            ("redirects", "1".to_string()),
-        ];
-
-        let response: LanguageLinksResponse = self
-            .http
-            .get(wiki_api_url(language)?)
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        Ok(response
-            .query
-            .pages
-            .into_iter()
-            .next()
-            .and_then(|page| page.langlinks)
-            .unwrap_or_default())
-    }
-
-    async fn article_pageviews(&self, language: &str, page_id: u64) -> Result<PageViews> {
-        let params = vec![
-            ("action", "query".to_string()),
-            ("format", "json".to_string()),
-            ("formatversion", "2".to_string()),
-            ("prop", "pageviews".to_string()),
-            ("pageids", page_id.to_string()),
-            ("pvipdays", "30".to_string()),
-            ("redirects", "1".to_string()),
-        ];
-
-        let response: PageViewsResponse = self
-            .http
-            .get(wiki_api_url(language)?)
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        let views_by_date = response
-            .query
-            .pages
-            .into_iter()
-            .next()
-            .and_then(|page| page.pageviews)
-            .unwrap_or_default();
-
-        Ok(PageViews {
-            days: views_by_date.len(),
-            total: views_by_date.values().filter_map(|views| *views).sum(),
-            latest: views_by_date
-                .iter()
-                .filter_map(|(date, views)| Some((date.clone(), (*views)?)))
-                .max_by(|(left_date, _), (right_date, _)| left_date.cmp(right_date)),
+        Ok(ArticleMetadataParts {
+            info,
+            revisions: page.revisions.unwrap_or_default(),
+            external_links,
+            language_links: page.langlinks.unwrap_or_default(),
+            pageviews,
         })
     }
 
@@ -3849,6 +3718,18 @@ fn pageviews_url(language: &str, title: &str) -> String {
     )
 }
 
+fn pageviews_from_map(views_by_date: Option<HashMap<String, Option<u64>>>) -> PageViews {
+    let views_by_date = views_by_date.unwrap_or_default();
+    PageViews {
+        days: views_by_date.len(),
+        total: views_by_date.values().filter_map(|views| *views).sum(),
+        latest: views_by_date
+            .iter()
+            .filter_map(|(date, views)| Some((date.clone(), (*views)?)))
+            .max_by(|(left_date, _), (right_date, _)| left_date.cmp(right_date)),
+    }
+}
+
 fn commons_page_url(page_props: &HashMap<String, String>) -> Option<String> {
     page_props
         .get("commonscat")
@@ -4028,6 +3909,43 @@ fn split_telegram_text(text: &str, limit: usize) -> Vec<String> {
 
     if !current.is_empty() {
         parts.push(current);
+    }
+
+    parts
+}
+
+fn split_html_lines_for_telegram(html: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    let mut parts = Vec::new();
+    let mut current = String::new();
+
+    for line in html.lines() {
+        let line = if line.chars().count() > limit {
+            html_escape_text(&truncate_for_telegram(&html_to_plain_text(line), limit))
+        } else {
+            line.to_string()
+        };
+
+        if current.is_empty() {
+            current = line;
+            continue;
+        }
+
+        if current.chars().count() + 1 + line.chars().count() <= limit {
+            current.push('\n');
+            current.push_str(&line);
+        } else {
+            parts.push(current);
+            current = line;
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    if parts.is_empty() {
+        parts.push(String::new());
     }
 
     parts
@@ -4470,6 +4388,14 @@ struct ArticleMetadata {
     pageviews: PageViews,
 }
 
+struct ArticleMetadataParts {
+    info: ArticleInfo,
+    revisions: Vec<Revision>,
+    external_links: Vec<String>,
+    language_links: Vec<LanguageLink>,
+    pageviews: PageViews,
+}
+
 #[derive(Debug, Clone, Default)]
 struct PageViews {
     days: usize,
@@ -4583,6 +4509,10 @@ struct InfoPage {
     pageprops: Option<HashMap<String, String>>,
     coordinates: Option<Vec<Coordinate>>,
     categoryinfo: Option<CategoryInfoDto>,
+    revisions: Option<Vec<Revision>>,
+    extlinks: Option<Vec<ExternalLink>>,
+    langlinks: Option<Vec<LanguageLink>>,
+    pageviews: Option<HashMap<String, Option<u64>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4597,21 +4527,6 @@ struct Coordinate {
     globe: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RevisionsResponse {
-    query: RevisionsQuery,
-}
-
-#[derive(Debug, Deserialize)]
-struct RevisionsQuery {
-    pages: Vec<RevisionsPage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RevisionsPage {
-    revisions: Option<Vec<Revision>>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct Revision {
     revid: Option<u64>,
@@ -4623,59 +4538,14 @@ struct Revision {
 }
 
 #[derive(Debug, Deserialize)]
-struct ExternalLinksResponse {
-    query: ExternalLinksQuery,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExternalLinksQuery {
-    pages: Vec<ExternalLinksPage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExternalLinksPage {
-    extlinks: Option<Vec<ExternalLink>>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ExternalLink {
     url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LanguageLinksResponse {
-    query: LanguageLinksQuery,
-}
-
-#[derive(Debug, Deserialize)]
-struct LanguageLinksQuery {
-    pages: Vec<LanguageLinksPage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LanguageLinksPage {
-    langlinks: Option<Vec<LanguageLink>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct LanguageLink {
     lang: String,
     langname: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PageViewsResponse {
-    query: PageViewsQuery,
-}
-
-#[derive(Debug, Deserialize)]
-struct PageViewsQuery {
-    pages: Vec<PageViewsPage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PageViewsPage {
-    pageviews: Option<HashMap<String, Option<u64>>>,
 }
 
 #[derive(Debug, Deserialize)]
