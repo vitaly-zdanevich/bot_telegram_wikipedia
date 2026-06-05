@@ -100,13 +100,18 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CURRENT_TARGET_RUSTFL
 
 echo "Building $BIN_NAME for $TARGET with target-cpu=$RUST_TARGET_CPU"
 
-if "$CARGO_LAMBDA" build --help >/dev/null 2>&1; then
-  CARGO_LAMBDA_BUILD=(build)
+if cargo lambda build --help >/dev/null 2>&1; then
+  CARGO_LAMBDA_BUILD=(cargo lambda build)
+elif "$CARGO_LAMBDA" build --help >/dev/null 2>&1; then
+  CARGO_LAMBDA_BUILD=("$CARGO_LAMBDA" build)
+elif "$CARGO_LAMBDA" lambda build --help >/dev/null 2>&1; then
+  CARGO_LAMBDA_BUILD=("$CARGO_LAMBDA" lambda build)
 else
-  CARGO_LAMBDA_BUILD=(lambda build)
+  echo "cargo-lambda build command is not available" >&2
+  exit 1
 fi
 
-"$CARGO_LAMBDA" "${CARGO_LAMBDA_BUILD[@]}" \
+"${CARGO_LAMBDA_BUILD[@]}" \
   --manifest-path "$ROOT_DIR/Cargo.toml" \
   --release \
   --arm64 \
@@ -115,7 +120,15 @@ fi
   --bin "$BIN_NAME"
 
 rm -f "$OUTPUT_ZIP"
-cp "$LAMBDA_DIR/$BIN_NAME/bootstrap.zip" "$OUTPUT_ZIP"
+ZIP_CANDIDATE="$LAMBDA_DIR/$BIN_NAME/bootstrap.zip"
+if [[ ! -f "$ZIP_CANDIDATE" ]]; then
+  ZIP_CANDIDATE="$(find "$LAMBDA_DIR" -maxdepth 3 -type f \( -name bootstrap.zip -o -name '*.zip' \) | sort | head -n 1)"
+fi
+if [[ -z "$ZIP_CANDIDATE" || ! -f "$ZIP_CANDIDATE" ]]; then
+  echo "cargo-lambda did not produce a Lambda zip under $LAMBDA_DIR" >&2
+  exit 1
+fi
+cp "$ZIP_CANDIDATE" "$OUTPUT_ZIP"
 grant_shared_access "$OUTPUT_ZIP"
 
 echo "Wrote $OUTPUT_ZIP"
