@@ -1824,13 +1824,34 @@ impl WikiClient {
             }
         }
 
-        let labels = self
-            .wikidata_labels(&language, &label_ids.into_iter().collect::<Vec<_>>())
-            .await
-            .unwrap_or_else(|err| {
-                warn!(error = %err, item, "failed to fetch Wikidata labels");
-                HashMap::new()
-            });
+        let label_ids = label_ids.into_iter().collect::<Vec<_>>();
+        let external_id_property_ids = claims_by_property
+            .iter()
+            .filter(|(_property_id, claims)| {
+                claims.iter().any(|claim| {
+                    claim.mainsnak.datatype.as_deref() == Some("external-id")
+                        && claim
+                            .mainsnak
+                            .datavalue
+                            .as_ref()
+                            .and_then(|datavalue| datavalue.value.as_str())
+                            .is_some()
+                })
+            })
+            .map(|(property_id, _claims)| property_id.clone())
+            .collect::<Vec<_>>();
+
+        let labels = self.wikidata_labels(&language, &label_ids);
+        let property_formatters = self.wikidata_property_formatters(&external_id_property_ids);
+        let (labels, property_formatters) = tokio::join!(labels, property_formatters);
+        let labels = labels.unwrap_or_else(|err| {
+            warn!(error = %err, item, "failed to fetch Wikidata labels");
+            HashMap::new()
+        });
+        let property_formatters = property_formatters.unwrap_or_else(|err| {
+            warn!(error = %err, item, "failed to fetch Wikidata formatter URLs");
+            HashMap::new()
+        });
 
         let mut properties = claims_by_property
             .into_iter()
@@ -1839,7 +1860,14 @@ impl WikiClient {
                     .unwrap_or_else(|| property_id.clone());
                 let values = claims
                     .iter()
-                    .filter_map(|claim| render_wikidata_snak_value(&claim.mainsnak, &labels))
+                    .filter_map(|claim| {
+                        render_wikidata_snak_value(
+                            &property_id,
+                            &claim.mainsnak,
+                            &labels,
+                            &property_formatters,
+                        )
+                    })
                     .take(WIKIDATA_VALUES_PER_PROPERTY_LIMIT)
                     .collect::<Vec<_>>();
                 WikidataPropertyClaims {
@@ -1865,6 +1893,71 @@ impl WikiClient {
 
         self.cache_put(cache_key, &claims, |cache| &mut cache.wikidata_claims);
         Ok(claims)
+    }
+
+    async fn wikidata_property_formatters(
+        &self,
+        property_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        let mut unique_ids = property_ids
+            .iter()
+            .filter_map(|id| normalize_wikidata_entity_id(id))
+            .filter(|id| id.starts_with('P'))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        unique_ids.sort();
+        if unique_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut formatters = HashMap::new();
+        let mut missing_ids = Vec::new();
+        for property_id in unique_ids {
+            let cache_key = format!("wikidata_property_formatter:{property_id}");
+            match self.cache_get(&cache_key, |cache| &mut cache.wikidata_property_formatters) {
+                Some(Some(formatter)) => {
+                    formatters.insert(property_id, formatter);
+                }
+                Some(None) => {}
+                None => missing_ids.push(property_id),
+            }
+        }
+
+        for chunk in missing_ids.chunks(WIKIDATA_ENTITY_BATCH_SIZE) {
+            let params = vec![
+                ("action", "wbgetentities".to_string()),
+                ("format", "json".to_string()),
+                ("ids", chunk.join("|")),
+                ("props", "claims".to_string()),
+            ];
+
+            let response: WikidataEntitiesResponse = self
+                .http
+                .get(WIKIDATA_API_URL)
+                .query(&params)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            for property_id in chunk {
+                let formatter = response
+                    .entities
+                    .get(property_id)
+                    .and_then(wikidata_formatter_url_from_entity);
+                let cache_key = format!("wikidata_property_formatter:{property_id}");
+                self.cache_put(cache_key, &formatter, |cache| {
+                    &mut cache.wikidata_property_formatters
+                });
+                if let Some(formatter) = formatter {
+                    formatters.insert(property_id.clone(), formatter);
+                }
+            }
+        }
+
+        Ok(formatters)
     }
 
     async fn wikidata_labels(
@@ -2138,6 +2231,7 @@ struct RamCache {
     wikidata_entities: HashMap<String, CacheEntry<WikidataEntity>>,
     wikidata_claims: HashMap<String, CacheEntry<WikidataClaims>>,
     wikidata_labels: HashMap<String, CacheEntry<HashMap<String, WikidataLabelInfo>>>,
+    wikidata_property_formatters: HashMap<String, CacheEntry<Option<String>>>,
     wikidata_page_metadata: HashMap<String, CacheEntry<WikidataPageMetadata>>,
 }
 
@@ -4207,8 +4301,10 @@ fn render_wikidata_page_metadata_html(metadata: &WikidataPageMetadata) -> String
 }
 
 fn render_wikidata_snak_value(
+    property_id: &str,
     snak: &WikidataSnak,
     labels: &HashMap<String, WikidataLabelInfo>,
+    property_formatters: &HashMap<String, String>,
 ) -> Option<String> {
     let Some(datavalue) = &snak.datavalue else {
         return match snak.snaktype.as_deref() {
@@ -4223,6 +4319,12 @@ fn render_wikidata_snak_value(
     }
 
     if let Some(value) = datavalue.value.as_str() {
+        if snak.datatype.as_deref() == Some("external-id")
+            && let Some(formatter) = property_formatters.get(property_id)
+            && let Some(url) = wikidata_external_id_url(formatter, value)
+        {
+            return Some(html_link(&url, value));
+        }
         if snak.datatype.as_deref() == Some("commonsMedia") {
             return Some(html_link(&commons_file_url(value), value));
         }
@@ -4304,6 +4406,17 @@ fn wikidata_monolingual_text_value(value: &serde_json::Map<String, Value>) -> Op
         ),
         None => html_escape_text(text),
     })
+}
+
+fn wikidata_external_id_url(formatter: &str, value: &str) -> Option<String> {
+    let formatter = formatter.trim();
+    let value = value.trim();
+    if formatter.is_empty() || value.is_empty() || !formatter.contains("$1") {
+        return None;
+    }
+
+    let url = formatter.replace("$1", &urlencoding::encode(value));
+    is_absolute_url(&url).then_some(url)
 }
 
 fn wikidata_entity_link(entity_id: &str, labels: &HashMap<String, WikidataLabelInfo>) -> String {
@@ -4498,6 +4611,25 @@ fn wikidata_commons_url_from_entity(entity: &WikidataEntity) -> Option<String> {
                             .map(commons_category_url)
                     })
                 })
+        })
+}
+
+fn wikidata_formatter_url_from_entity(entity: &WikidataEntity) -> Option<String> {
+    entity
+        .claims
+        .as_ref()?
+        .get("P1630")?
+        .iter()
+        .find_map(|claim| {
+            claim
+                .mainsnak
+                .datavalue
+                .as_ref()?
+                .value
+                .as_str()
+                .map(str::trim)
+                .filter(|formatter| is_absolute_url(formatter) && formatter.contains("$1"))
+                .map(ToOwned::to_owned)
         })
 }
 
@@ -6397,6 +6529,7 @@ mod tests {
     #[test]
     fn wikidata_url_values_render_clickable() {
         let rendered = render_wikidata_snak_value(
+            "P856",
             &WikidataSnak {
                 datatype: Some("url".to_string()),
                 snaktype: Some("value".to_string()),
@@ -6405,12 +6538,72 @@ mod tests {
                 }),
             },
             &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
 
         assert_eq!(
             rendered,
             "<a href=\"https://example.com/source\">https://example.com/source</a>"
+        );
+    }
+
+    #[test]
+    fn wikidata_external_id_values_render_clickable_with_formatter() {
+        let rendered = render_wikidata_snak_value(
+            "P12245",
+            &WikidataSnak {
+                datatype: Some("external-id".to_string()),
+                snaktype: Some("value".to_string()),
+                datavalue: Some(WikidataDataValue {
+                    value: Value::String("2888".to_string()),
+                }),
+            },
+            &HashMap::new(),
+            &HashMap::from([(
+                "P12245".to_string(),
+                "https://www.gamesmeter.nl/game/$1".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "<a href=\"https://www.gamesmeter.nl/game/2888\">2888</a>"
+        );
+    }
+
+    #[test]
+    fn wikidata_external_id_formatter_urls_are_url_encoded() {
+        assert_eq!(
+            wikidata_external_id_url("https://example.com/search?id=$1", "a b/1"),
+            Some("https://example.com/search?id=a%20b%2F1".to_string())
+        );
+    }
+
+    #[test]
+    fn wikidata_property_formatter_is_extracted_from_p1630() {
+        let entity = WikidataEntity {
+            sitelinks: None,
+            labels: None,
+            descriptions: None,
+            claims: Some(HashMap::from([(
+                "P1630".to_string(),
+                vec![WikidataClaim {
+                    mainsnak: WikidataSnak {
+                        datatype: Some("string".to_string()),
+                        snaktype: Some("value".to_string()),
+                        datavalue: Some(WikidataDataValue {
+                            value: Value::String("https://www.gamesmeter.nl/game/$1".to_string()),
+                        }),
+                    },
+                }],
+            )])),
+        };
+
+        assert_eq!(
+            wikidata_formatter_url_from_entity(&entity),
+            Some("https://www.gamesmeter.nl/game/$1".to_string())
         );
     }
 
