@@ -5355,6 +5355,23 @@ mod tests {
     }
 
     #[test]
+    fn html_line_splitter_does_not_break_links() {
+        let html = [
+            "Metadata",
+            "<a href=\"https://example.com/one\">one</a>",
+            "<a href=\"https://example.com/two\">two</a>",
+        ]
+        .join("\n");
+
+        let parts = split_html_lines_for_telegram(&html, 55);
+
+        assert!(parts.len() > 1);
+        for part in parts {
+            assert_eq!(part.matches("<a ").count(), part.matches("</a>").count());
+        }
+    }
+
+    #[test]
     fn mediawiki_nav_templates_extract_title_and_article_buttons() {
         let html = r#"
             <div class="navbox">
