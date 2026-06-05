@@ -40,6 +40,8 @@ Public bot: https://t.me/wikipedia_unofficial_bot
 - Attach clickable category buttons at the end of article output.
 - Load newest article pages in a category from inline category buttons. Category
   buttons are Telegram callbacks, not external category links.
+- Page category article and subcategory results with `Prev`/`Next` callback
+  buttons.
 - Return article links from navigation templates as callback buttons when
   MediaWiki exposes `navbox`/sidebar navigation markup. The message title uses
   the navigation-template name when MediaWiki exposes it.
@@ -101,7 +103,7 @@ graph TD
     C -- Category alias --> Q[Search matching categories]
     Q --> R[Send clickable category names and category buttons]
     C -- Category button --> U[Load subcategories and newest pages in parallel]
-    U --> V[Send subcategory buttons and article-title buttons]
+    U --> V[Send subcategory buttons and article-title buttons with Prev/Next]
     C -- Inline query --> S[Search Wikipedia or category]
     S --> T[Answer inline chooser with article cards]
 ```

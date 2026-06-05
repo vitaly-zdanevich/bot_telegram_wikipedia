@@ -30,8 +30,6 @@ const DEFAULT_RAM_CACHE_MAX_ENTRIES: usize = 512;
 const TELEGRAM_MAX_BUTTON_TEXT: usize = 64;
 const CATEGORY_BUTTON_LIMIT: usize = 12;
 const CATEGORY_SEARCH_FETCH_LIMIT: usize = 500;
-const CATEGORY_MEMBER_SCAN_LIMIT: usize = 500;
-const CATEGORY_SUBCATEGORY_SCAN_PAGE_LIMIT: usize = 8;
 const NAV_TEMPLATE_LINK_LIMIT: usize = 30;
 const DISAMBIGUATION_LINK_LIMIT: usize = 30;
 const ARTICLE_TITLE_LOOKUP_LIMIT: usize = 50;
@@ -313,6 +311,17 @@ impl App {
                 self.send_category_members(chat_id, &language, &title)
                     .await?;
             }
+            Ok(CallbackAction::CategoryPage {
+                language,
+                page_id,
+                kind,
+                page_index,
+            }) => {
+                self.answer_callback_query(&callback.id, "Loading category page...", false)
+                    .await?;
+                self.send_category_page(chat_id, &language, page_id, kind, page_index)
+                    .await?;
+            }
             Ok(CallbackAction::ArticleCategory {
                 language,
                 page_id,
@@ -510,7 +519,7 @@ impl App {
 
         let articles = async {
             self.wiki
-                .category_articles(language, title, self.config.search_limit)
+                .category_articles_page(language, title, self.config.search_limit, 0)
                 .await
                 .with_context(|| {
                     format!(
@@ -520,7 +529,7 @@ impl App {
         };
         let subcategories = async {
             self.wiki
-                .category_subcategories(language, title, self.config.search_limit)
+                .category_subcategories_page(language, title, self.config.search_limit, 0)
                 .await
                 .with_context(|| {
                     format!(
@@ -543,8 +552,8 @@ impl App {
         info!(
             language,
             title,
-            articles = articles.len(),
-            subcategories = subcategories.len(),
+            articles = articles.articles.len(),
+            subcategories = subcategories.categories.len(),
             "loaded category members"
         );
 
@@ -573,7 +582,7 @@ impl App {
             .await?;
         }
 
-        if articles.is_empty() && subcategories.is_empty() {
+        if articles.articles.is_empty() && subcategories.categories.is_empty() {
             self.send_message(
                 chat_id,
                 &format!("No category members found in {title} on {language}.wikipedia.org."),
@@ -583,32 +592,159 @@ impl App {
             return Ok(());
         }
 
-        if !subcategories.is_empty() {
+        if !subcategories.categories.is_empty() {
             self.send_html_message(
                 chat_id,
-                &render_category_subcategories_heading_html(language, title),
-                category_subcategories_keyboard(language, &subcategories),
+                &render_category_subcategories_page_heading_html(
+                    language,
+                    title,
+                    subcategories.page_index,
+                ),
+                category_subcategories_keyboard_with_pagination(
+                    language,
+                    &subcategories.categories,
+                    overview.page_id.map(|page_id| CategoryPagination {
+                        language,
+                        page_id,
+                        kind: CategoryPageKind::Subcategories,
+                        page_index: subcategories.page_index,
+                        has_next: subcategories.has_next,
+                    }),
+                ),
             )
             .await?;
         }
 
-        if !articles.is_empty() {
-            let reply_markup = json!({
-                "inline_keyboard": article_results_keyboard(
+        if !articles.articles.is_empty() {
+            let reply_markup = category_articles_keyboard(
+                language,
+                &articles.articles,
+                self.config.big_article_char_threshold,
+                self.config.small_article_char_threshold,
+                articles.articles.len() == 1,
+                overview.page_id.map(|page_id| CategoryPagination {
                     language,
-                    &articles,
-                    self.config.big_article_char_threshold,
-                    self.config.small_article_char_threshold,
-                    articles.len() == 1
-                )
-            });
+                    page_id,
+                    kind: CategoryPageKind::Articles,
+                    page_index: articles.page_index,
+                    has_next: articles.has_next,
+                }),
+            );
 
             self.send_html_message(
                 chat_id,
-                &render_category_articles_heading_html(language, title),
-                Some(reply_markup),
+                &render_category_articles_page_heading_html(language, title, articles.page_index),
+                reply_markup,
             )
             .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_category_page(
+        &self,
+        chat_id: i64,
+        language: &str,
+        page_id: u64,
+        kind: CategoryPageKind,
+        page_index: usize,
+    ) -> Result<()> {
+        self.send_chat_action(chat_id, "typing").await?;
+
+        let title = self
+            .wiki
+            .category_title_by_page_id(language, page_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve category page_id={page_id} from {language}.wikipedia.org"
+                )
+            })?;
+
+        match kind {
+            CategoryPageKind::Articles => {
+                let page = self
+                    .wiki
+                    .category_articles_page(language, &title, self.config.search_limit, page_index)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load category article page {page_index} for {title} from {language}.wikipedia.org"
+                        )
+                    })?;
+                if page.articles.is_empty() {
+                    self.send_message(chat_id, "No articles found on this category page.", None)
+                        .await?;
+                    return Ok(());
+                }
+
+                self.send_html_message(
+                    chat_id,
+                    &render_category_articles_page_heading_html(language, &title, page.page_index),
+                    category_articles_keyboard(
+                        language,
+                        &page.articles,
+                        self.config.big_article_char_threshold,
+                        self.config.small_article_char_threshold,
+                        page.articles.len() == 1,
+                        Some(CategoryPagination {
+                            language,
+                            page_id,
+                            kind,
+                            page_index: page.page_index,
+                            has_next: page.has_next,
+                        }),
+                    ),
+                )
+                .await?;
+            }
+            CategoryPageKind::Subcategories => {
+                let page = self
+                    .wiki
+                    .category_subcategories_page(
+                        language,
+                        &title,
+                        self.config.search_limit,
+                        page_index,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load subcategory page {page_index} for {title} from {language}.wikipedia.org"
+                        )
+                    })?;
+                if page.categories.is_empty() {
+                    self.send_message(
+                        chat_id,
+                        "No subcategories found on this category page.",
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                self.send_html_message(
+                    chat_id,
+                    &render_category_subcategories_page_heading_html(
+                        language,
+                        &title,
+                        page.page_index,
+                    ),
+                    category_subcategories_keyboard_with_pagination(
+                        language,
+                        &page.categories,
+                        Some(CategoryPagination {
+                            language,
+                            page_id,
+                            kind,
+                            page_index: page.page_index,
+                            has_next: page.has_next,
+                        }),
+                    ),
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -1296,85 +1432,121 @@ impl WikiClient {
         title: &str,
         limit: usize,
     ) -> Result<Vec<ArticleButton>> {
-        let normalized_title = normalize_category_title_for_language(title, language);
-        let cache_key = format!("category_articles:{language}:{limit}:{normalized_title}");
-        if let Some(articles) = self.cache_get(&cache_key, |cache| &mut cache.category_articles) {
-            return Ok(articles);
-        }
-
-        let params = vec![
-            ("action", "query".to_string()),
-            ("format", "json".to_string()),
-            ("formatversion", "2".to_string()),
-            ("generator", "categorymembers".to_string()),
-            ("gcmtitle", normalized_title.clone()),
-            ("gcmnamespace", "0".to_string()),
-            ("gcmsort", "timestamp".to_string()),
-            ("gcmdir", "desc".to_string()),
-            ("gcmprop", "ids|title|timestamp".to_string()),
-            ("gcmlimit", limit.min(MAX_SEARCH_LIMIT).to_string()),
-            ("prop", "info".to_string()),
-        ];
-
-        let response: CategoryInfoResponse = self
-            .http
-            .get(wiki_api_url(language)?)
-            .query(&params)
-            .send()
+        Ok(self
+            .category_articles_page(language, title, limit, 0)
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        let articles = response
-            .query
-            .map(|query| query.pages)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|page| Some((page.pageid?, page.title, page.length)))
-            .map(|(page_id, title, length)| ArticleButton {
-                page_id,
-                title,
-                size: length,
-                wordcount: None,
-                snippet: None,
-            })
-            .collect::<Vec<_>>();
-        self.cache_put(cache_key, &articles, |cache| &mut cache.category_articles);
-        Ok(articles)
+            .articles)
     }
 
-    async fn category_subcategories(
+    async fn category_articles_page(
         &self,
         language: &str,
         title: &str,
         limit: usize,
-    ) -> Result<Vec<Category>> {
+        page_index: usize,
+    ) -> Result<CategoryArticlePage> {
         let normalized_title = normalize_category_title_for_language(title, language);
-        let cache_key = format!("category_subcategories:{language}:{limit}:{normalized_title}");
-        if let Some(categories) =
-            self.cache_get(&cache_key, |cache| &mut cache.category_subcategories)
-        {
-            return Ok(categories);
+        let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
+        let cache_key =
+            format!("category_articles:{language}:{limit}:{page_index}:{normalized_title}");
+        if let Some(page) = self.cache_get(&cache_key, |cache| &mut cache.category_articles) {
+            return Ok(page);
         }
 
-        let limit = limit.min(MAX_SEARCH_LIMIT);
-        let mut categories = Vec::new();
-        let mut seen = HashSet::new();
+        let members = self
+            .category_member_titles_page(language, &normalized_title, 0, limit, page_index)
+            .await?;
+        let titles = members
+            .members
+            .iter()
+            .map(|member| member.title.clone())
+            .collect::<Vec<_>>();
+        let pages_by_title = self.article_pages_by_titles(language, &titles).await?;
+        let articles = members
+            .members
+            .into_iter()
+            .filter_map(|member| {
+                let page = pages_by_title.get(&normalized_title_key(&member.title))?;
+                Some(ArticleButton {
+                    page_id: page.pageid?,
+                    title: member.title,
+                    size: page.length,
+                    wordcount: None,
+                    snippet: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let page = CategoryArticlePage {
+            articles,
+            page_index,
+            has_next: members.has_next,
+        };
+        self.cache_put(cache_key, &page, |cache| &mut cache.category_articles);
+        Ok(page)
+    }
+
+    async fn category_subcategories_page(
+        &self,
+        language: &str,
+        title: &str,
+        limit: usize,
+        page_index: usize,
+    ) -> Result<CategorySubcategoryPage> {
+        let normalized_title = normalize_category_title_for_language(title, language);
+        let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
+        let cache_key =
+            format!("category_subcategories:{language}:{limit}:{page_index}:{normalized_title}");
+        if let Some(page) = self.cache_get(&cache_key, |cache| &mut cache.category_subcategories) {
+            return Ok(page);
+        }
+
+        let members = self
+            .category_member_titles_page(language, &normalized_title, 14, limit, page_index)
+            .await?;
+        let categories = members
+            .members
+            .into_iter()
+            .map(|member| Category {
+                title: normalize_category_title_for_language(&member.title, language),
+                article_count: None,
+            })
+            .collect::<Vec<_>>();
+        let page = CategorySubcategoryPage {
+            categories,
+            page_index,
+            has_next: members.has_next,
+        };
+        self.cache_put(cache_key, &page, |cache| &mut cache.category_subcategories);
+        Ok(page)
+    }
+
+    async fn category_member_titles_page(
+        &self,
+        language: &str,
+        normalized_title: &str,
+        namespace: u8,
+        limit: usize,
+        page_index: usize,
+    ) -> Result<CategoryMemberTitlePage> {
         let mut continuation: Option<String> = None;
 
-        for _ in 0..CATEGORY_SUBCATEGORY_SCAN_PAGE_LIMIT {
+        for current_page in 0..=page_index {
+            let request_limit = if current_page == page_index {
+                limit + 1
+            } else {
+                limit
+            };
             let mut params = vec![
                 ("action", "query".to_string()),
                 ("format", "json".to_string()),
                 ("formatversion", "2".to_string()),
                 ("list", "categorymembers".to_string()),
-                ("cmtitle", normalized_title.clone()),
-                ("cmnamespace", "14".to_string()),
+                ("cmtitle", normalized_title.to_string()),
+                ("cmnamespace", namespace.to_string()),
                 ("cmsort", "timestamp".to_string()),
                 ("cmdir", "desc".to_string()),
                 ("cmprop", "ids|title|timestamp".to_string()),
-                ("cmlimit", CATEGORY_MEMBER_SCAN_LIMIT.to_string()),
+                ("cmlimit", request_limit.to_string()),
             ];
             if let Some(value) = continuation.as_deref() {
                 params.push(("cmcontinue", value.to_string()));
@@ -1390,40 +1562,69 @@ impl WikiClient {
                 .json()
                 .await?;
 
-            for member in response
+            let mut members = response
                 .query
                 .map(|query| query.categorymembers)
-                .unwrap_or_default()
-            {
-                let title = normalize_category_title_for_language(&member.title, language);
-                let key = title.to_lowercase();
-                if seen.insert(key) {
-                    categories.push(Category {
-                        title,
-                        article_count: None,
-                    });
-                }
-                if categories.len() >= limit {
-                    break;
-                }
-            }
-
-            if categories.len() >= limit {
-                break;
-            }
-
-            continuation = response
+                .unwrap_or_default();
+            let next_continuation = response
                 .continuation
                 .and_then(|continuation| continuation.cmcontinue);
-            if continuation.is_none() {
-                break;
+
+            if current_page == page_index {
+                let has_next = members.len() > limit || next_continuation.is_some();
+                members.truncate(limit);
+                return Ok(CategoryMemberTitlePage { members, has_next });
             }
+
+            let Some(next) = next_continuation else {
+                return Ok(CategoryMemberTitlePage {
+                    members: Vec::new(),
+                    has_next: false,
+                });
+            };
+            continuation = Some(next);
         }
 
-        self.cache_put(cache_key, &categories, |cache| {
-            &mut cache.category_subcategories
-        });
-        Ok(categories)
+        Ok(CategoryMemberTitlePage {
+            members: Vec::new(),
+            has_next: false,
+        })
+    }
+
+    async fn category_title_by_page_id(&self, language: &str, page_id: u64) -> Result<String> {
+        let cache_key = format!("category_title:{language}:{page_id}");
+        if let Some(title) = self.cache_get(&cache_key, |cache| &mut cache.category_titles) {
+            return Ok(title);
+        }
+
+        let params = vec![
+            ("action", "query".to_string()),
+            ("format", "json".to_string()),
+            ("formatversion", "2".to_string()),
+            ("prop", "info".to_string()),
+            ("pageids", page_id.to_string()),
+            ("redirects", "1".to_string()),
+        ];
+
+        let response: InfoResponse = self
+            .http
+            .get(wiki_api_url(language)?)
+            .query(&params)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let title = response
+            .query
+            .pages
+            .into_iter()
+            .next()
+            .map(|page| normalize_category_title_for_language(&page.title, language))
+            .context("Wikipedia returned no category title")?;
+        self.cache_put(cache_key, &title, |cache| &mut cache.category_titles);
+        Ok(title)
     }
 
     async fn category_overview(&self, language: &str, title: &str) -> Result<CategoryOverview> {
@@ -1476,6 +1677,7 @@ impl WikiClient {
             })
             .collect::<Vec<_>>();
         let overview = CategoryOverview {
+            page_id: page.pageid,
             description,
             parent_categories,
         };
@@ -2322,8 +2524,9 @@ impl WikiClient {
 struct RamCache {
     search: HashMap<String, CacheEntry<Vec<ArticleButton>>>,
     category_search: HashMap<String, CacheEntry<Vec<Category>>>,
-    category_articles: HashMap<String, CacheEntry<Vec<ArticleButton>>>,
-    category_subcategories: HashMap<String, CacheEntry<Vec<Category>>>,
+    category_articles: HashMap<String, CacheEntry<CategoryArticlePage>>,
+    category_subcategories: HashMap<String, CacheEntry<CategorySubcategoryPage>>,
+    category_titles: HashMap<String, CacheEntry<String>>,
     category_overviews: HashMap<String, CacheEntry<CategoryOverview>>,
     article_content: HashMap<String, CacheEntry<ArticleContent>>,
     article_categories: HashMap<String, CacheEntry<Vec<Category>>>,
@@ -2828,6 +3031,12 @@ enum CallbackAction {
         language: String,
         title: String,
     },
+    CategoryPage {
+        language: String,
+        page_id: u64,
+        kind: CategoryPageKind,
+        page_index: usize,
+    },
     ArticleCategory {
         language: String,
         page_id: u64,
@@ -2862,6 +3071,37 @@ fn parse_callback_data(
             bail!("article callback has extra fields");
         }
         return Ok(CallbackAction::Article { language, page_id });
+    }
+
+    if let Some(rest) = data.strip_prefix("catpage:") {
+        let mut parts = rest.split(':');
+        let language = parts
+            .next()
+            .and_then(normalize_language_code)
+            .context("category page callback has invalid language")?;
+        let page_id = parts
+            .next()
+            .context("category page callback has no page id")?
+            .parse::<u64>()
+            .context("category page callback page id is invalid")?;
+        let kind = parts
+            .next()
+            .and_then(CategoryPageKind::from_callback_code)
+            .context("category page callback has invalid kind")?;
+        let page_index = parts
+            .next()
+            .context("category page callback has no page index")?
+            .parse::<usize>()
+            .context("category page callback page index is invalid")?;
+        if parts.next().is_some() {
+            bail!("category page callback has extra fields");
+        }
+        return Ok(CallbackAction::CategoryPage {
+            language,
+            page_id,
+            kind,
+            page_index,
+        });
     }
 
     if let Some(rest) = data.strip_prefix("article_category:") {
@@ -3118,12 +3358,17 @@ fn category_search_keyboard(language: &str, categories: &[Category]) -> Option<V
     Some(json!({ "inline_keyboard": rows }))
 }
 
-fn category_subcategories_keyboard(language: &str, subcategories: &[Category]) -> Option<Value> {
+fn category_subcategories_keyboard_with_pagination(
+    language: &str,
+    subcategories: &[Category],
+    pagination: Option<CategoryPagination<'_>>,
+) -> Option<Value> {
     let rows = category_buttons_rows(
         language,
         subcategories,
         subcategory_button_style(subcategories.len()),
     );
+    let rows = with_category_pagination_row(rows, pagination);
     if rows.is_empty() {
         return None;
     }
@@ -3198,6 +3443,76 @@ fn article_categories_keyboard(
     Some(json!({ "inline_keyboard": rows }))
 }
 
+fn category_articles_keyboard(
+    language: &str,
+    articles: &[ArticleButton],
+    big_article_char_threshold: usize,
+    small_article_char_threshold: usize,
+    highlight_as_primary: bool,
+    pagination: Option<CategoryPagination<'_>>,
+) -> Option<Value> {
+    let rows = article_results_keyboard(
+        language,
+        articles,
+        big_article_char_threshold,
+        small_article_char_threshold,
+        highlight_as_primary,
+    );
+    let rows = with_category_pagination_row(rows, pagination);
+    (!rows.is_empty()).then(|| json!({ "inline_keyboard": rows }))
+}
+
+#[derive(Clone, Copy)]
+struct CategoryPagination<'a> {
+    language: &'a str,
+    page_id: u64,
+    kind: CategoryPageKind,
+    page_index: usize,
+    has_next: bool,
+}
+
+fn with_category_pagination_row(
+    mut rows: Vec<Vec<Value>>,
+    pagination: Option<CategoryPagination<'_>>,
+) -> Vec<Vec<Value>> {
+    if let Some(row) = pagination.and_then(category_pagination_row) {
+        rows.push(row);
+    }
+    rows
+}
+
+fn category_pagination_row(pagination: CategoryPagination<'_>) -> Option<Vec<Value>> {
+    let mut row = Vec::new();
+    if pagination.page_index > 0
+        && let Some(callback_data) = category_page_callback_data(
+            pagination.language,
+            pagination.page_id,
+            pagination.kind,
+            pagination.page_index - 1,
+        )
+    {
+        row.push(json!({
+            "text": "Prev",
+            "callback_data": callback_data,
+        }));
+    }
+    if pagination.has_next
+        && let Some(callback_data) = category_page_callback_data(
+            pagination.language,
+            pagination.page_id,
+            pagination.kind,
+            pagination.page_index + 1,
+        )
+    {
+        row.push(json!({
+            "text": "Next",
+            "callback_data": callback_data,
+        }));
+    }
+
+    (!row.is_empty()).then_some(row)
+}
+
 fn category_button(language: &str, page_id: u64, index: usize, category: &Category) -> Value {
     let title = &category.title;
     let text = truncate_for_telegram(&category_display_title(title), TELEGRAM_MAX_BUTTON_TEXT);
@@ -3261,6 +3576,20 @@ fn wikidata_property_button_style(property_count: Option<usize>) -> Option<&'sta
 fn wikidata_callback_data(language: &str, item: &str) -> Option<String> {
     let item = normalize_wikidata_entity_id(item)?;
     let data = format!("wikidata:{language}:{item}");
+    (data.len() <= 64).then_some(data)
+}
+
+fn category_page_callback_data(
+    language: &str,
+    page_id: u64,
+    kind: CategoryPageKind,
+    page_index: usize,
+) -> Option<String> {
+    let language = normalize_language_code(language)?;
+    let data = format!(
+        "catpage:{language}:{page_id}:{}:{page_index}",
+        kind.callback_code()
+    );
     (data.len() <= 64).then_some(data)
 }
 
@@ -3424,18 +3753,35 @@ fn render_category_description_html_parts(
     combine_html_sections(vec![format!("{heading}\n\n{description}")], limit)
 }
 
-fn render_category_subcategories_heading_html(language: &str, title: &str) -> String {
-    render_category_heading_html(language, title, "Subcategories in")
+fn render_category_subcategories_page_heading_html(
+    language: &str,
+    title: &str,
+    page_index: usize,
+) -> String {
+    render_category_page_heading_html(language, title, "Subcategories in", page_index)
 }
 
-fn render_category_articles_heading_html(language: &str, title: &str) -> String {
-    render_category_heading_html(language, title, "Newest article pages in")
+fn render_category_articles_page_heading_html(
+    language: &str,
+    title: &str,
+    page_index: usize,
+) -> String {
+    render_category_page_heading_html(language, title, "Newest article pages in", page_index)
 }
 
-fn render_category_heading_html(language: &str, title: &str, prefix: &str) -> String {
+fn render_category_page_heading_html(
+    language: &str,
+    title: &str,
+    prefix: &str,
+    page_index: usize,
+) -> String {
     let title = normalize_category_title_for_language(title, language);
     let linked_title = html_link(&article_url(language, &title), &title);
-    format!("{prefix} {linked_title}")
+    if page_index == 0 {
+        format!("{prefix} {linked_title}")
+    } else {
+        format!("{prefix} {linked_title} (page {})", page_index + 1)
+    }
 }
 
 fn render_references_html_parts(references_html: &str, limit: usize) -> Vec<String> {
@@ -5520,7 +5866,51 @@ struct Category {
 }
 
 #[derive(Debug, Clone)]
+struct CategoryArticlePage {
+    articles: Vec<ArticleButton>,
+    page_index: usize,
+    has_next: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CategorySubcategoryPage {
+    categories: Vec<Category>,
+    page_index: usize,
+    has_next: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CategoryMemberTitlePage {
+    members: Vec<CategoryMemberDto>,
+    has_next: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CategoryPageKind {
+    Articles,
+    Subcategories,
+}
+
+impl CategoryPageKind {
+    fn callback_code(self) -> &'static str {
+        match self {
+            Self::Articles => "a",
+            Self::Subcategories => "s",
+        }
+    }
+
+    fn from_callback_code(value: &str) -> Option<Self> {
+        match value {
+            "a" => Some(Self::Articles),
+            "s" => Some(Self::Subcategories),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct CategoryOverview {
+    page_id: Option<u64>,
     description: Option<String>,
     parent_categories: Vec<Category>,
 }
@@ -5651,7 +6041,7 @@ struct CategoryMembersQuery {
     categorymembers: Vec<CategoryMemberDto>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CategoryMemberDto {
     title: String,
 }
@@ -5910,6 +6300,7 @@ mod tests {
             }
             CallbackAction::Article { .. }
             | CallbackAction::Category { .. }
+            | CallbackAction::CategoryPage { .. }
             | CallbackAction::Wikidata { .. }
             | CallbackAction::Images { .. } => {
                 panic!("expected article category callback")
@@ -5930,6 +6321,7 @@ mod tests {
             }
             CallbackAction::Article { .. }
             | CallbackAction::Category { .. }
+            | CallbackAction::CategoryPage { .. }
             | CallbackAction::ArticleCategory { .. }
             | CallbackAction::Images { .. } => {
                 panic!("expected Wikidata callback")
@@ -5950,9 +6342,38 @@ mod tests {
             }
             CallbackAction::Article { .. }
             | CallbackAction::Category { .. }
+            | CallbackAction::CategoryPage { .. }
             | CallbackAction::ArticleCategory { .. }
             | CallbackAction::Wikidata { .. } => {
                 panic!("expected article images callback")
+            }
+        }
+    }
+
+    #[test]
+    fn category_page_callback_round_trips_page_kind_and_index() {
+        let data = category_page_callback_data("EN", 98765, CategoryPageKind::Articles, 2).unwrap();
+        assert_eq!(data, "catpage:en:98765:a:2");
+
+        let action = parse_callback_data(&data, &[]).unwrap();
+        match action {
+            CallbackAction::CategoryPage {
+                language,
+                page_id,
+                kind,
+                page_index,
+            } => {
+                assert_eq!(language, "en");
+                assert_eq!(page_id, 98765);
+                assert_eq!(kind, CategoryPageKind::Articles);
+                assert_eq!(page_index, 2);
+            }
+            CallbackAction::Article { .. }
+            | CallbackAction::Category { .. }
+            | CallbackAction::ArticleCategory { .. }
+            | CallbackAction::Wikidata { .. }
+            | CallbackAction::Images { .. } => {
+                panic!("expected category page callback")
             }
         }
     }
@@ -6147,28 +6568,90 @@ mod tests {
 
     #[test]
     fn category_headings_link_full_category_title() {
-        let rendered = render_category_subcategories_heading_html("en", "Category:PC games");
+        let rendered =
+            render_category_subcategories_page_heading_html("en", "Category:PC games", 0);
 
         assert!(rendered.starts_with("Subcategories in "));
         assert!(rendered.contains(
             "<a href=\"https://en.wikipedia.org/wiki/Category%3APC_games\">Category:PC games</a>"
         ));
 
-        let rendered = render_category_articles_heading_html("en", "Category:PC games");
+        let rendered = render_category_articles_page_heading_html("en", "Category:PC games", 0);
         assert!(rendered.starts_with("Newest article pages in "));
         assert!(rendered.contains(
             "<a href=\"https://en.wikipedia.org/wiki/Category%3APC_games\">Category:PC games</a>"
         ));
+
+        let rendered = render_category_articles_page_heading_html("en", "Category:PC games", 1);
+        assert!(rendered.ends_with("(page 2)"));
     }
 
     #[test]
-    fn single_subcategory_button_uses_primary_style() {
-        let keyboard = category_subcategories_keyboard(
+    fn category_article_keyboard_adds_next_and_previous_buttons() {
+        let keyboard = category_articles_keyboard(
+            "en",
+            &[ArticleButton {
+                page_id: 42,
+                title: "Example".to_string(),
+                size: Some(2000),
+                wordcount: None,
+                snippet: None,
+            }],
+            DEFAULT_BIG_ARTICLE_CHAR_THRESHOLD,
+            DEFAULT_SMALL_ARTICLE_CHAR_THRESHOLD,
+            false,
+            Some(CategoryPagination {
+                language: "en",
+                page_id: 98765,
+                kind: CategoryPageKind::Articles,
+                page_index: 1,
+                has_next: true,
+            }),
+        )
+        .unwrap();
+
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+        let nav = rows.last().unwrap().as_array().unwrap();
+        assert_eq!(nav[0]["text"], "Prev");
+        assert_eq!(nav[0]["callback_data"], "catpage:en:98765:a:0");
+        assert_eq!(nav[1]["text"], "Next");
+        assert_eq!(nav[1]["callback_data"], "catpage:en:98765:a:2");
+    }
+
+    #[test]
+    fn category_subcategory_keyboard_adds_next_button_on_first_page() {
+        let keyboard = category_subcategories_keyboard_with_pagination(
             "en",
             &[Category {
                 title: "Category:PC games by genre".to_string(),
                 article_count: None,
             }],
+            Some(CategoryPagination {
+                language: "en",
+                page_id: 98765,
+                kind: CategoryPageKind::Subcategories,
+                page_index: 0,
+                has_next: true,
+            }),
+        )
+        .unwrap();
+
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+        let nav = rows.last().unwrap().as_array().unwrap();
+        assert_eq!(nav.len(), 1);
+        assert_eq!(nav[0]["text"], "Next");
+        assert_eq!(nav[0]["callback_data"], "catpage:en:98765:s:1");
+    }
+
+    #[test]
+    fn single_subcategory_button_uses_primary_style() {
+        let keyboard = category_subcategories_keyboard_with_pagination(
+            "en",
+            &[Category {
+                title: "Category:PC games by genre".to_string(),
+                article_count: None,
+            }],
+            None,
         )
         .unwrap();
 
@@ -6191,7 +6674,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let keyboard = category_subcategories_keyboard("en", &subcategories).unwrap();
+        let keyboard =
+            category_subcategories_keyboard_with_pagination("en", &subcategories, None).unwrap();
 
         let rows = keyboard["inline_keyboard"].as_array().unwrap();
         assert_eq!(rows[0][0]["style"], "danger");
