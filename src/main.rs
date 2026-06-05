@@ -876,6 +876,30 @@ impl App {
             }
         }
 
+        if let Some(body_links_task) = body_links_task {
+            match join_task(body_links_task).await {
+                Ok(links) => {
+                    if !links.is_empty() {
+                        self.send_html_message(
+                            chat_id,
+                            &html_bold("Article links"),
+                            Some(json!({
+                                "inline_keyboard": article_results_keyboard(
+                                    &language,
+                                    &links,
+                                    self.config.big_article_char_threshold,
+                                    self.config.small_article_char_threshold,
+                                    false
+                                )
+                            })),
+                        )
+                        .await?;
+                    }
+                }
+                Err(err) => warn!(error = %err, "failed to fetch article body links"),
+            }
+        }
+
         if let Some(disambiguation_task) = disambiguation_task {
             match join_task(disambiguation_task).await {
                 Ok(links) => {
@@ -924,30 +948,6 @@ impl App {
                     }
                 }
                 Err(err) => warn!(error = %err, "failed to fetch navigation template links"),
-            }
-        }
-
-        if let Some(body_links_task) = body_links_task {
-            match join_task(body_links_task).await {
-                Ok(links) => {
-                    if !links.is_empty() {
-                        self.send_html_message(
-                            chat_id,
-                            &html_bold("Article links"),
-                            Some(json!({
-                                "inline_keyboard": article_results_keyboard(
-                                    &language,
-                                    &links,
-                                    self.config.big_article_char_threshold,
-                                    self.config.small_article_char_threshold,
-                                    false
-                                )
-                            })),
-                        )
-                        .await?;
-                    }
-                }
-                Err(err) => warn!(error = %err, "failed to fetch article body links"),
             }
         }
 
