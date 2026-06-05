@@ -5838,6 +5838,15 @@ struct WikidataLocalizedValue {
 mod tests {
     use super::*;
 
+    const ARMIES_OF_EXIGO_HTML: &str =
+        include_str!("../tests/fixtures/wikipedia/armies_of_exigo.html");
+    const FLAG_OF_ADJARA_HTML: &str =
+        include_str!("../tests/fixtures/wikipedia/flag_of_adjara.html");
+    const MILL_FARM_INN_HTML: &str = include_str!("../tests/fixtures/wikipedia/mill_farm_inn.html");
+    const PORTA_BATUMI_TOWER_HTML: &str =
+        include_str!("../tests/fixtures/wikipedia/porta_batumi_tower.html");
+    const VOSTOK_1_RU_HTML: &str = include_str!("../tests/fixtures/wikipedia/vostok_1_ru.html");
+
     #[test]
     fn parses_language_prefixed_search() {
         let request = parse_search_request("lang:fr Albert Camus", "en").unwrap();
@@ -6459,6 +6468,149 @@ mod tests {
         ));
         assert!(!rendered.contains("[1]"));
         assert!(!rendered.contains("Reference text"));
+    }
+
+    #[test]
+    fn golden_armies_of_exigo_keeps_infobox_body_and_reference_links() {
+        let infobox = extract_infobox_text("en", ARMIES_OF_EXIGO_HTML).unwrap();
+
+        assert!(infobox.contains("Armies of Exigo"));
+        assert!(infobox.contains(
+            "Developer: <a href=\"https://en.wikipedia.org/wiki/Black_Hole_Entertainment\">Black Hole Entertainment</a>"
+        ));
+        assert!(infobox.contains(
+            "Platform: <a href=\"https://en.wikipedia.org/wiki/Microsoft_Windows\">Microsoft Windows</a>"
+        ));
+        assert!(infobox.contains(
+            "Modes: <a href=\"https://en.wikipedia.org/wiki/Single-player_video_game\">Single-player</a>, <a href=\"https://en.wikipedia.org/wiki/Multiplayer_video_game\">multiplayer</a>"
+        ));
+
+        let body =
+            mediawiki_html_to_telegram_html("en", "Armies of Exigo", ARMIES_OF_EXIGO_HTML).unwrap();
+        assert!(body.contains(
+            "<a href=\"https://en.wikipedia.org/wiki/Real-time_strategy\">real-time strategy</a>"
+        ));
+        assert!(body.contains(
+            "<a href=\"https://en.wikipedia.org/wiki/Black_Hole_Entertainment\">Black Hole Entertainment</a>"
+        ));
+        assert!(!body.contains("Example Review"));
+
+        let references = mediawiki_references_to_telegram_html("en", ARMIES_OF_EXIGO_HTML).unwrap();
+        assert!(references.contains("1. Review at Example Review."));
+        assert!(references.contains(
+            "<a href=\"https://example.com/armies-review\">https://example.com/armies-review</a>"
+        ));
+        assert!(!references.contains("^"));
+    }
+
+    #[test]
+    fn golden_mill_farm_inn_drops_locmap_css_and_keeps_real_fields() {
+        let infobox = extract_infobox_text("en", MILL_FARM_INN_HTML).unwrap();
+
+        assert!(infobox.contains("Mill Farm Inn"));
+        assert!(infobox.contains("Mill Farm Inn, September 2012"));
+        assert!(infobox.contains(
+            "Location: <a href=\"https://en.wikipedia.org/wiki/Anson_County,_North_Carolina\">Anson County, North Carolina</a>"
+        ));
+        assert!(infobox.contains("Built: 1840"));
+        assert!(!infobox.contains(".mw-parser-output"));
+        assert!(!infobox.contains("position:absolute"));
+        assert!(!infobox.contains("locmap"));
+        assert!(!infobox.contains("Show map"));
+
+        let image = extract_infobox_image(MILL_FARM_INN_HTML).unwrap();
+        assert_eq!(image.title, "File:Mill Farm Inn.jpg");
+        assert_eq!(
+            image.url,
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0a/Mill_Farm_Inn.jpg/320px-Mill_Farm_Inn.jpg"
+        );
+    }
+
+    #[test]
+    fn golden_porta_batumi_tower_drops_map_caption_and_keeps_navigation_title() {
+        let infobox = extract_infobox_text("en", PORTA_BATUMI_TOWER_HTML).unwrap();
+        assert!(infobox.contains("Porta Batumi Tower"));
+        assert!(infobox.contains("Status: Completed"));
+        assert!(infobox.contains(
+            "Location: <a href=\"https://en.wikipedia.org/wiki/Batumi\">Batumi</a>, <a href=\"https://en.wikipedia.org/wiki/Georgia_(country)\">Georgia</a>"
+        ));
+        assert!(!infobox.contains("Interactive map"));
+
+        let body =
+            mediawiki_html_to_telegram_html("en", "Porta Batumi Tower", PORTA_BATUMI_TOWER_HTML)
+                .unwrap();
+        assert!(body.contains("<a href=\"https://en.wikipedia.org/wiki/Batumi\">Batumi</a>"));
+
+        let templates = mediawiki_nav_templates("en", PORTA_BATUMI_TOWER_HTML);
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].title, "Skyscrapers in Georgia");
+        assert_eq!(
+            templates[0].title_url.as_deref(),
+            Some("https://en.wikipedia.org/wiki/List_of_tallest_buildings_in_Georgia_(country)")
+        );
+        assert!(
+            templates[0]
+                .links
+                .iter()
+                .any(|link| link.label == "Batumi Tower" && link.page_title == "Batumi Tower")
+        );
+    }
+
+    #[test]
+    fn golden_vostok_1_ru_links_coordinates_and_drops_infobox_noise() {
+        let infobox = extract_infobox_text("ru", VOSTOK_1_RU_HTML).unwrap();
+
+        assert!(infobox.contains("Восток-1"));
+        assert!(
+            infobox.contains("Страна: <a href=\"https://ru.wikipedia.org/wiki/СССР\">СССР</a>")
+        );
+        assert!(infobox.contains("Стартовая площадка: 45°55′ с. ш. 63°20′ в. д."));
+        assert!(!infobox.contains("Медиафайлы"));
+        assert!(!infobox.lines().any(|line| line == "1"));
+        assert!(!infobox.contains("«Кедр»"));
+
+        let rendered = render_infobox_html(&infobox, 3900);
+        assert!(rendered.contains(
+            "https://geohack.toolforge.org/geohack.php?params=45.916666666666664_N_63.333333333333336_E"
+        ));
+
+        let body = mediawiki_html_to_telegram_html("ru", "Восток-1", VOSTOK_1_RU_HTML).unwrap();
+        assert!(body.contains(
+            "<a href=\"https://ru.wikipedia.org/wiki/Гагарин,_Юрий_Алексеевич\">Юрий Гагарин</a>"
+        ));
+    }
+
+    #[test]
+    fn golden_flag_of_adjara_extracts_image_and_clickable_navigation_title() {
+        let image = extract_infobox_image(FLAG_OF_ADJARA_HTML).unwrap();
+        assert_eq!(image.title, "File:Flag of Adjara.svg");
+        assert_eq!(
+            image.url,
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/7/71/Flag_of_Adjara.svg/320px-Flag_of_Adjara.svg.png"
+        );
+
+        let templates = mediawiki_nav_templates("en", FLAG_OF_ADJARA_HTML);
+        assert_eq!(templates.len(), 1);
+        assert_eq!(
+            templates[0].title,
+            "Flags of the Autonomous Soviet Socialist Republics"
+        );
+        assert_eq!(
+            templates[0].title_url.as_deref(),
+            Some(
+                "https://en.wikipedia.org/wiki/Flags_of_the_Autonomous_Soviet_Socialist_Republics"
+            )
+        );
+
+        let heading = render_navigation_heading_html(&NavTemplateButtons {
+            title: templates[0].title.clone(),
+            title_url: templates[0].title_url.clone(),
+            buttons: Vec::new(),
+        });
+        assert_eq!(
+            heading,
+            "<b>Navigation: <a href=\"https://en.wikipedia.org/wiki/Flags_of_the_Autonomous_Soviet_Socialist_Republics\">Flags of the Autonomous Soviet Socialist Republics</a></b>"
+        );
     }
 
     #[test]
