@@ -21,7 +21,9 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Generate Rust coverage
-        run: cargo llvm-cov --locked --all-targets --lcov --output-path target/llvm-cov/lcov.info
+        run: |
+          mkdir -p target/llvm-cov
+          cargo llvm-cov --locked --all-targets --lcov --output-path target/llvm-cov/lcov.info
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         env:
