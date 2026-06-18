@@ -1,3 +1,11 @@
+//! AWS Lambda Telegram bot that searches Wikipedia, renders article content for
+//! Telegram HTML, and fetches slower metadata/media follow-ups in parallel.
+//!
+//! The file is intentionally single-module for Lambda packaging simplicity, but
+//! the functions are grouped by boundary: webhook handling, Telegram sends,
+//! Wikimedia clients, callback/keyboard builders, HTML extraction/rendering, and
+//! media cleanup.
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Mutex;
@@ -58,6 +66,7 @@ static SUP_RE: OnceLock<Regex> = OnceLock::new();
 static TAG_RE: OnceLock<Regex> = OnceLock::new();
 static COORDINATE_DMS_RE: OnceLock<Regex> = OnceLock::new();
 
+/// Starts the Lambda HTTP runtime and initializes structured logging.
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -71,6 +80,11 @@ async fn main() -> Result<(), Error> {
     run(service_fn(handler)).await
 }
 
+/// Handles Telegram webhook requests from the Lambda Function URL.
+///
+/// The handler authenticates Telegram's secret token, parses the update, and
+/// intentionally returns `200 OK` after logging bot errors so Telegram does not
+/// retry already-received updates.
 async fn handler(request: Request) -> Result<impl IntoResponse, Error> {
     let config = Config::from_env()?;
 
@@ -104,6 +118,7 @@ async fn handler(request: Request) -> Result<impl IntoResponse, Error> {
     Ok(response(StatusCode::OK, "ok"))
 }
 
+/// Builds a small plain-text Lambda response.
 fn response(status: StatusCode, body: &'static str) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -112,6 +127,7 @@ fn response(status: StatusCode, body: &'static str) -> Response<Body> {
         .expect("static response is valid")
 }
 
+/// Deserializes a Telegram update from the Lambda body variants we accept.
 fn parse_update(body: &Body) -> Result<Update> {
     match body {
         Body::Text(text) => serde_json::from_str(text).context("failed to parse text body"),
@@ -121,6 +137,7 @@ fn parse_update(body: &Body) -> Result<Update> {
     }
 }
 
+/// Flattens an anyhow error chain for concise structured log fields.
 fn format_error_chain(err: &anyhow::Error) -> String {
     err.chain()
         .map(ToString::to_string)
@@ -146,6 +163,8 @@ struct Config {
 }
 
 impl Config {
+    /// Reads Lambda environment variables and normalizes the values used by the
+    /// bot at runtime.
     fn from_env() -> Result<Self> {
         let default_wiki_language = normalize_language_code(
             &optional_env("DEFAULT_WIKI_LANGUAGE").unwrap_or_else(|| "en".to_string()),
@@ -208,6 +227,8 @@ struct App {
 }
 
 impl App {
+    /// Creates the application facade and shared HTTP client used for Telegram
+    /// and Wikimedia requests.
     fn new(config: Config) -> Result<Self> {
         let timeout = Duration::from_secs(config.http_timeout_seconds);
         let http = HTTP_CLIENT
@@ -232,6 +253,8 @@ impl App {
         })
     }
 
+    /// Routes one Telegram update to the matching message, callback, or inline
+    /// query handler.
     async fn handle_update(&self, update: Update) -> Result<()> {
         if let Some(callback) = update.callback_query {
             return self.handle_callback(callback).await;
@@ -252,6 +275,8 @@ impl App {
         Ok(())
     }
 
+    /// Handles normal chat messages: commands, category aliases, and Wikipedia
+    /// search queries.
     async fn handle_message(&self, message: Message) -> Result<()> {
         let chat_id = message.chat.id;
         if !self.is_allowed_user(message.from.as_ref().map(|user| user.id)) {
@@ -293,6 +318,7 @@ impl App {
             .await
     }
 
+    /// Handles Telegram callback button payloads produced by this bot.
     async fn handle_callback(&self, callback: CallbackQuery) -> Result<()> {
         if !self.is_allowed_user(Some(callback.from.id)) {
             warn!(
@@ -377,6 +403,8 @@ impl App {
         Ok(())
     }
 
+    /// Handles inline mode by returning article cards that can be inserted into
+    /// any chat.
     async fn handle_inline_query(&self, inline_query: InlineQuery) -> Result<()> {
         if !self.is_allowed_user(Some(inline_query.from.id)) {
             warn!(
@@ -437,11 +465,13 @@ impl App {
         .await
     }
 
+    /// Checks the optional allow-list for public or restricted bot operation.
     fn is_allowed_user(&self, user_id: Option<i64>) -> bool {
         self.config.allowed_telegram_user_ids.is_empty()
             || user_id.is_some_and(|id| self.config.allowed_telegram_user_ids.contains(&id))
     }
 
+    /// Sends usage text and configured favorite category buttons.
     async fn send_help(&self, chat_id: i64) -> Result<()> {
         let text = format!(
             "Send a Wikipedia search query.\n\nInline mode also works: type this bot's username followed by a query in any chat.\n\nUse lang:&lt;code&gt; before a query for a specific Wikipedia, for example <b>lang:be Беларусь</b>.\n\nFor Latin text I use {} by default. For scripts such as Cyrillic, Georgian, Arabic, Hebrew, Greek, Japanese, Korean, Chinese, Hindi, and Thai I pick the matching Wikipedia automatically.\n\nUse /category lang:Category name to search matching categories, then press a category button to show subcategories and newest pages added to it. Category aliases also work: Category:Physics, Category: Physics, Category Physics, c Physics, Категория Физика, Категория:Физика, Катэгорыя Навука, Катэгорыя:Навука, к Физика, к be:Навука.\n\nSource code: {}",
@@ -456,6 +486,7 @@ impl App {
         .await
     }
 
+    /// Searches Wikipedia and sends article result buttons.
     async fn send_search_results(&self, chat_id: i64, language: &str, query: &str) -> Result<()> {
         self.send_chat_action(chat_id, "typing").await?;
 
@@ -493,6 +524,7 @@ impl App {
         .await
     }
 
+    /// Searches matching category pages and sends category callback buttons.
     async fn send_category_search(
         &self,
         chat_id: i64,
@@ -528,6 +560,8 @@ impl App {
         .await
     }
 
+    /// Sends a category overview, parent categories, subcategories, and newest
+    /// article pages.
     async fn send_category_members(&self, chat_id: i64, language: &str, title: &str) -> Result<()> {
         self.send_chat_action(chat_id, "typing").await?;
 
@@ -668,6 +702,7 @@ impl App {
         Ok(())
     }
 
+    /// Sends a paginated category article or subcategory page.
     async fn send_category_page(
         &self,
         chat_id: i64,
@@ -785,6 +820,8 @@ impl App {
         Ok(())
     }
 
+    /// Sends an article body first, then slower follow-up data such as links,
+    /// disambiguation groups, navigation, categories, metadata, and media.
     async fn send_article(&self, chat_id: i64, language: String, page_id: u64) -> Result<()> {
         self.send_chat_action(chat_id, "typing").await?;
 
@@ -1023,6 +1060,7 @@ impl App {
         Ok(())
     }
 
+    /// Sends a simple heading with article callback buttons.
     async fn send_article_buttons_message(
         &self,
         chat_id: i64,
@@ -1039,6 +1077,8 @@ impl App {
         .await
     }
 
+    /// Sends article callback buttons under a pre-rendered Telegram HTML
+    /// heading.
     async fn send_article_buttons_message_with_heading_html(
         &self,
         chat_id: i64,
@@ -1066,6 +1106,7 @@ impl App {
         .await
     }
 
+    /// Fetches and sends Wikidata claims and Wikidata page metadata.
     async fn send_wikidata(&self, chat_id: i64, language: &str, item: &str) -> Result<()> {
         self.send_chat_action(chat_id, "typing").await?;
 
@@ -1109,6 +1150,8 @@ impl App {
         Ok(())
     }
 
+    /// Sends media follow-ups after the article body, including optional image
+    /// galleries and audio.
     async fn send_media(&self, chat_id: i64, context: ArticleMediaSend<'_>) -> Result<()> {
         let images = filter_excluded_media_items(
             article_gallery_images(context.media, context.infobox_image),
@@ -1149,6 +1192,7 @@ impl App {
         Ok(())
     }
 
+    /// Loads and sends the article image gallery for an Images callback.
     async fn send_article_images(&self, chat_id: i64, language: &str, page_id: u64) -> Result<()> {
         self.send_chat_action(chat_id, "upload_photo").await?;
 
@@ -1172,6 +1216,8 @@ impl App {
         self.send_image_gallery(chat_id, &images).await
     }
 
+    /// Sends images as a Telegram media group, falling back to individual sends
+    /// when Telegram rejects the group.
     async fn send_image_gallery(&self, chat_id: i64, images: &[MediaItem]) -> Result<()> {
         let images = images
             .iter()
@@ -1227,6 +1273,7 @@ impl App {
         Ok(())
     }
 
+    /// Sends images one by one when media groups are not usable for a page.
     async fn send_image_gallery_individually(
         &self,
         chat_id: i64,
@@ -1251,6 +1298,7 @@ impl App {
         Ok(())
     }
 
+    /// Sends one photo using the original URL and optional fallback thumbnail.
     async fn send_media_item(&self, chat_id: i64, image: &MediaItem) -> Result<bool> {
         self.send_chat_action(chat_id, "upload_photo").await?;
         let mut payload = json!({
@@ -1305,6 +1353,7 @@ impl App {
         Ok(true)
     }
 
+    /// Sends a plain text Telegram message.
     async fn send_message(
         &self,
         chat_id: i64,
@@ -1315,6 +1364,7 @@ impl App {
             .await
     }
 
+    /// Sends a Telegram message with HTML parse mode.
     async fn send_html_message(
         &self,
         chat_id: i64,
@@ -1325,6 +1375,7 @@ impl App {
             .await
     }
 
+    /// Sends a Telegram message with optional parse mode and reply markup.
     async fn send_message_with_parse_mode(
         &self,
         chat_id: i64,
@@ -1349,6 +1400,7 @@ impl App {
         self.telegram_post("sendMessage", &payload).await
     }
 
+    /// Sends Telegram chat actions such as `typing` or `upload_photo`.
     async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
         self.telegram_post(
             "sendChatAction",
@@ -1360,6 +1412,7 @@ impl App {
         .await
     }
 
+    /// Acknowledges a callback query to clear Telegram's loading spinner.
     async fn answer_callback_query(
         &self,
         callback_query_id: &str,
@@ -1377,6 +1430,7 @@ impl App {
         .await
     }
 
+    /// Answers an inline query with article results.
     async fn answer_inline_query(
         &self,
         inline_query_id: &str,
@@ -1396,6 +1450,7 @@ impl App {
         .await
     }
 
+    /// Posts a JSON payload to one Telegram Bot API method.
     async fn telegram_post(&self, method: &str, payload: &Value) -> Result<()> {
         let url = format!(
             "https://api.telegram.org/bot{}/{}",
@@ -1426,6 +1481,8 @@ struct WikiClient {
 }
 
 impl WikiClient {
+    /// Creates a Wikimedia API client with a shared HTTP client and RAM cache
+    /// capacity.
     fn new(http: Client, cache_max_entries: usize) -> Self {
         Self {
             http,
@@ -1433,6 +1490,7 @@ impl WikiClient {
         }
     }
 
+    /// Searches article pages for normal chat mode.
     async fn search(
         &self,
         language: &str,
@@ -1486,6 +1544,8 @@ impl WikiClient {
         Ok(results)
     }
 
+    /// Searches article pages for inline mode and fetches lead extracts in the
+    /// same request.
     async fn inline_search(
         &self,
         language: &str,
@@ -1545,6 +1605,7 @@ impl WikiClient {
         Ok(results)
     }
 
+    /// Searches category pages by inclusion-style title matching.
     async fn search_categories(
         &self,
         language: &str,
@@ -1607,6 +1668,7 @@ impl WikiClient {
         Ok(categories)
     }
 
+    /// Returns the first page of newest article members for a category.
     async fn category_articles(
         &self,
         language: &str,
@@ -1619,6 +1681,8 @@ impl WikiClient {
             .articles)
     }
 
+    /// Returns one page of newest article members, resolving page IDs and sizes
+    /// with a batched title lookup.
     async fn category_articles_page(
         &self,
         language: &str,
@@ -1667,6 +1731,7 @@ impl WikiClient {
         Ok(page)
     }
 
+    /// Returns one page of subcategory members for a category.
     async fn category_subcategories_page(
         &self,
         language: &str,
@@ -1702,6 +1767,7 @@ impl WikiClient {
         Ok(page)
     }
 
+    /// Fetches raw category member titles for a namespace and page offset.
     async fn category_member_titles_page(
         &self,
         language: &str,
@@ -1773,6 +1839,7 @@ impl WikiClient {
         })
     }
 
+    /// Resolves a category page ID back to its localized title.
     async fn category_title_by_page_id(&self, language: &str, page_id: u64) -> Result<String> {
         let cache_key = format!("category_title:{language}:{page_id}");
         if let Some(title) = self.cache_get(&cache_key, |cache| &mut cache.category_titles) {
@@ -1809,6 +1876,7 @@ impl WikiClient {
         Ok(title)
     }
 
+    /// Fetches category description, parent categories, and member counts.
     async fn category_overview(&self, language: &str, title: &str) -> Result<CategoryOverview> {
         let normalized_title = normalize_category_title_for_language(title, language);
         let cache_key = format!("category_overview:{language}:{normalized_title}");
@@ -1871,6 +1939,7 @@ impl WikiClient {
         Ok(overview)
     }
 
+    /// Loads an article from cache or fetches and parses its MediaWiki HTML.
     async fn article_content(&self, language: &str, page_id: u64) -> Result<ArticleContent> {
         let cache_key = format!("article_content:{language}:{page_id}");
         if let Some(article) = self.cache_get(&cache_key, |cache| &mut cache.article_content) {
@@ -1882,6 +1951,8 @@ impl WikiClient {
         Ok(article)
     }
 
+    /// Fetches parsed article HTML and extracts the bot's renderable article
+    /// model from one Wikimedia parse call.
     async fn article_parsed_html(&self, language: &str, page_id: u64) -> Result<ArticleContent> {
         let params = vec![
             ("action", "parse".to_string()),
@@ -1942,6 +2013,7 @@ impl WikiClient {
         })
     }
 
+    /// Executes the article parse request with one retry for transient failures.
     async fn article_parse_response(
         &self,
         language: &str,
@@ -1980,6 +2052,8 @@ impl WikiClient {
         Err(last_error.expect("article parse retry loop stores first error"))
     }
 
+    /// Converts parsed internal links into article buttons with one batched
+    /// title lookup.
     async fn article_buttons_for_links(
         &self,
         language: &str,
@@ -2013,6 +2087,8 @@ impl WikiClient {
             .collect())
     }
 
+    /// Converts grouped disambiguation links into grouped buttons while keeping
+    /// the underlying title lookup batched.
     async fn article_button_groups_for_link_groups(
         &self,
         language: &str,
@@ -2052,6 +2128,8 @@ impl WikiClient {
             .collect())
     }
 
+    /// Converts navigation template links into grouped article buttons with one
+    /// batched title lookup.
     async fn article_buttons_for_nav_templates(
         &self,
         language: &str,
@@ -2099,6 +2177,7 @@ impl WikiClient {
             .collect())
     }
 
+    /// Fetches MediaWiki info for many titles in one query.
     async fn article_pages_by_titles(
         &self,
         language: &str,
@@ -2141,6 +2220,7 @@ impl WikiClient {
             .collect())
     }
 
+    /// Fetches article categories and their article counts.
     async fn article_categories(&self, language: &str, page_id: u64) -> Result<Vec<Category>> {
         let cache_key = format!("article_categories:{language}:{page_id}");
         if let Some(categories) = self.cache_get(&cache_key, |cache| &mut cache.article_categories)
@@ -2187,6 +2267,7 @@ impl WikiClient {
         Ok(categories)
     }
 
+    /// Fetches article metadata that is intentionally sent after the body.
     async fn article_metadata(
         &self,
         language: &str,
@@ -2238,6 +2319,7 @@ impl WikiClient {
         Ok(metadata)
     }
 
+    /// Fetches a raw Wikidata entity document.
     async fn wikidata_entity(&self, wikidata_item: &str) -> Result<WikidataEntity> {
         let wikidata_item =
             normalize_wikidata_entity_id(wikidata_item).context("Wikidata item id is invalid")?;
@@ -2273,6 +2355,8 @@ impl WikiClient {
         Ok(entity)
     }
 
+    /// Fetches the MediaWiki metadata parts that can be collected in parallel
+    /// with Wikidata-specific lookups.
     async fn article_metadata_parts(
         &self,
         language: &str,
@@ -2343,6 +2427,7 @@ impl WikiClient {
         })
     }
 
+    /// Fetches and formats Wikidata claims for a Wikidata button callback.
     async fn wikidata_claims(&self, language: &str, item: &str) -> Result<WikidataClaims> {
         let language =
             normalize_language_code(language).context("Wikidata claims language is invalid")?;
@@ -2445,6 +2530,7 @@ impl WikiClient {
         Ok(claims)
     }
 
+    /// Loads formatter URL templates for Wikidata property IDs in batches.
     async fn wikidata_property_formatters(
         &self,
         property_ids: &[String],
@@ -2510,6 +2596,7 @@ impl WikiClient {
         Ok(formatters)
     }
 
+    /// Loads localized labels and descriptions for Wikidata entity IDs.
     async fn wikidata_labels(
         &self,
         language: &str,
@@ -2570,6 +2657,7 @@ impl WikiClient {
         Ok(labels)
     }
 
+    /// Fetches MediaWiki metadata for a Wikidata entity page.
     async fn wikidata_page_metadata(
         &self,
         item: &str,
@@ -2628,6 +2716,7 @@ impl WikiClient {
         Ok(metadata)
     }
 
+    /// Fetches article image/audio metadata from MediaWiki.
     async fn article_media(&self, language: &str, page_id: u64) -> Result<ArticleMedia> {
         let cache_key = format!("article_media:{language}:{page_id}");
         if let Some(media) = self.cache_get(&cache_key, |cache| &mut cache.article_media) {
@@ -2736,6 +2825,7 @@ impl WikiClient {
         Ok(media)
     }
 
+    /// Resolves file titles to direct media URLs and dimensions in batches.
     async fn file_infos(&self, language: &str, titles: &[String]) -> Result<Vec<MediaItem>> {
         let params = vec![
             ("action", "query".to_string()),
@@ -2765,6 +2855,7 @@ impl WikiClient {
             .collect())
     }
 
+    /// Reads one typed value from the shared warm-Lambda RAM cache.
     fn cache_get<T, F>(&self, key: &str, select: F) -> Option<T>
     where
         T: Clone,
@@ -2773,6 +2864,7 @@ impl WikiClient {
         ram_cache_get(key, select)
     }
 
+    /// Stores one typed value in the shared warm-Lambda RAM cache.
     fn cache_put<T, F>(&self, key: String, value: &T, select: F)
     where
         T: Clone,
@@ -2806,6 +2898,7 @@ struct CacheEntry<T> {
     value: T,
 }
 
+/// Reads a value from the process-global cache used by warm Lambda instances.
 fn ram_cache_get<T, F>(key: &str, select: F) -> Option<T>
 where
     T: Clone,
@@ -2819,6 +2912,8 @@ where
     map.get(key).map(|entry| entry.value.clone())
 }
 
+/// Writes a value to the process-global cache and evicts one oldest entry if the
+/// configured capacity is exceeded.
 fn ram_cache_put<T, F>(key: String, value: T, max_entries: usize, select: F)
 where
     F: for<'a> FnOnce(&'a mut RamCache) -> &'a mut HashMap<String, CacheEntry<T>>,
@@ -2843,6 +2938,7 @@ where
     map.insert(key, CacheEntry { value });
 }
 
+/// Spawns a Wikimedia follow-up task on the Tokio runtime.
 fn spawn_wiki_task<T>(
     future: impl std::future::Future<Output = Result<T>> + Send + 'static,
 ) -> JoinHandle<Result<T>>
@@ -2852,23 +2948,28 @@ where
     tokio::spawn(future)
 }
 
+/// Awaits a spawned task and converts join failures into anyhow errors.
 async fn join_task<T>(handle: JoinHandle<Result<T>>) -> Result<T> {
     handle.await.context("background task panicked")?
 }
 
+/// Builds the MediaWiki API URL for a language code.
 fn wiki_api_url(language: &str) -> Result<String> {
     let language = normalize_language_code(language).context("invalid Wikipedia language code")?;
     Ok(format!("https://{language}.wikipedia.org/w/api.php"))
 }
 
+/// Reads a required environment variable.
 fn required_env(key: &str) -> Result<String> {
     env::var(key).with_context(|| format!("{key} is required"))
 }
 
+/// Reads an optional environment variable, treating empty strings as absent.
 fn optional_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
 }
 
+/// Parses an environment variable into a typed value with a default.
 fn parse_env<T>(key: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
@@ -2882,6 +2983,7 @@ where
     }
 }
 
+/// Parses a boolean environment variable with common true/false spellings.
 fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
     let Some(value) = optional_env(key) else {
         return Ok(default);
@@ -2894,6 +2996,7 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
     }
 }
 
+/// Parses the optional Telegram user allow-list.
 fn parse_allowed_telegram_user_ids() -> Result<HashSet<i64>> {
     let Some(value) = optional_env("ALLOWED_TELEGRAM_USER_IDS") else {
         return Ok(HashSet::new());
@@ -2915,6 +3018,7 @@ fn parse_allowed_telegram_user_ids() -> Result<HashSet<i64>> {
         .collect()
 }
 
+/// Normalizes a Wikipedia language code to the conservative format we accept.
 fn normalize_language_code(value: &str) -> Option<String> {
     let value = value.trim().to_ascii_lowercase();
     if (2..=16).contains(&value.len())
@@ -2928,6 +3032,7 @@ fn normalize_language_code(value: &str) -> Option<String> {
     }
 }
 
+/// Parses favorite category definitions from Lambda configuration.
 fn parse_favorite_categories(
     value: Option<&str>,
     default_language: &str,
@@ -2961,6 +3066,7 @@ fn parse_favorite_categories(
     Ok(favorites)
 }
 
+/// Normalizes a category title to the namespace prefix used by a given wiki.
 fn normalize_category_title_for_language(value: &str, language: &str) -> String {
     let trimmed = value.trim().replace('_', " ");
     let lower = trimmed.to_lowercase();
@@ -2975,6 +3081,8 @@ fn normalize_category_title_for_language(value: &str, language: &str) -> String 
     }
 }
 
+/// Returns the localized category namespace prefix for the languages we
+/// special-case.
 fn category_namespace_prefix(language: &str) -> &'static str {
     match language {
         "be" => "Катэгорыя",
@@ -2983,6 +3091,7 @@ fn category_namespace_prefix(language: &str) -> &'static str {
     }
 }
 
+/// Removes the category namespace for display text.
 fn category_display_title(title: &str) -> String {
     title
         .strip_prefix("Category:")
@@ -2993,6 +3102,7 @@ fn category_display_title(title: &str) -> String {
         .to_string()
 }
 
+/// Builds a MediaWiki search query for broad category lookup.
 fn category_search_query(query: &str) -> String {
     let query = query.trim();
     if query.split_whitespace().count() == 1 {
@@ -3002,6 +3112,7 @@ fn category_search_query(query: &str) -> String {
     }
 }
 
+/// Checks whether all category search terms appear in a candidate title.
 fn category_title_matches_query(title: &str, query: &str) -> bool {
     let title = category_display_title(title).to_lowercase();
     let query = query.to_lowercase();
@@ -3011,6 +3122,7 @@ fn category_title_matches_query(title: &str, query: &str) -> bool {
         .all(|part| title.contains(part))
 }
 
+/// Produces a sort key that prefers broad, useful category matches.
 fn category_search_score(
     title: &str,
     query: &str,
@@ -3033,6 +3145,7 @@ fn category_search_score(
     )
 }
 
+/// Buckets category titles by how broad or specific they appear for a query.
 fn category_specificity_bucket(title: &str, query: &str) -> u8 {
     if normalized_title_key(title) == normalized_title_key(query) {
         return 0;
@@ -3069,6 +3182,7 @@ fn category_specificity_bucket(title: &str, query: &str) -> u8 {
     }
 }
 
+/// Filters out maintenance categories from user-facing category search ranking.
 fn is_maintenance_category_title(title: &str) -> bool {
     let title = title.to_lowercase();
     [
@@ -3090,6 +3204,7 @@ struct SearchRequest {
     query: String,
 }
 
+/// Parses a free-text Wikipedia search request and optional `lang:` prefix.
 fn parse_search_request(text: &str, default_language: &str) -> Result<SearchRequest> {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix("lang:") {
@@ -3120,6 +3235,7 @@ struct CategoryRequest {
     title: String,
 }
 
+/// Parses `/category` commands and category aliases such as `c games`.
 fn parse_category_command(text: &str, default_language: &str) -> Result<Option<CategoryRequest>> {
     let (value, forced_language) = if let Some(rest) = text.strip_prefix("/category") {
         (rest.trim(), None)
@@ -3140,10 +3256,12 @@ fn parse_category_command(text: &str, default_language: &str) -> Result<Option<C
     )?))
 }
 
+/// Parses one category value from configuration or user input.
 fn parse_category_value(value: &str, default_language: &str) -> Result<CategoryRequest> {
     parse_category_value_with_forced_language(value, default_language, None)
 }
 
+/// Parses a category value with an optional externally forced language.
 fn parse_category_value_with_forced_language(
     value: &str,
     default_language: &str,
@@ -3162,6 +3280,8 @@ fn parse_category_value_with_forced_language(
     })
 }
 
+/// Splits a `lang:title` category value while preserving titles that contain
+/// colons.
 fn parse_language_prefixed_category_value<'a>(
     value: &'a str,
     default_language: &str,
@@ -3193,6 +3313,8 @@ struct CategoryAlias<'a> {
     forced_language: Option<&'static str>,
 }
 
+/// Recognizes category shortcut prefixes across English, Russian, and Belarusian
+/// user input.
 fn strip_category_alias(text: &str) -> Option<CategoryAlias<'_>> {
     let text = text.trim();
     let lower = text.to_lowercase();
@@ -3218,6 +3340,7 @@ fn strip_category_alias(text: &str) -> Option<CategoryAlias<'_>> {
     None
 }
 
+/// Chooses a likely Wikipedia language from the script used in a user query.
 fn detect_language(text: &str, default_language: &str) -> String {
     if text
         .chars()
@@ -3315,6 +3438,7 @@ enum CallbackAction {
     },
 }
 
+/// Decodes the compact callback payloads used by Telegram buttons.
 fn parse_callback_data(
     data: &str,
     favorite_categories: &[FavoriteCategory],
@@ -3471,6 +3595,7 @@ fn parse_callback_data(
     bail!("unknown callback data")
 }
 
+/// Builds Telegram inline query result cards for article suggestions.
 fn inline_query_results(language: &str, results: &[ArticleButton]) -> Vec<Value> {
     results
         .iter()
@@ -3500,6 +3625,7 @@ fn inline_query_results(language: &str, results: &[ArticleButton]) -> Vec<Value>
         .collect()
 }
 
+/// Builds the HTML inserted into chat when a user selects an inline result.
 fn inline_message_text(language: &str, result: &ArticleButton, url: &str) -> String {
     let title = html_bold(&result.title);
     let url_link = html_link(url, url);
@@ -3519,6 +3645,7 @@ fn inline_message_text(language: &str, result: &ArticleButton, url: &str) -> Str
     format!("{title}\n\n{snippet}\n\n{url_link}")
 }
 
+/// Builds a short plain-text inline result description.
 fn inline_result_description(language: &str, result: &ArticleButton) -> String {
     let mut parts = vec![format!("{language}.wikipedia.org")];
     if let Some(snippet) = result
@@ -3538,6 +3665,7 @@ fn inline_result_description(language: &str, result: &ArticleButton) -> String {
     parts.join(" | ")
 }
 
+/// Normalizes MediaWiki plaintext extracts while preserving paragraph breaks.
 fn normalize_inline_extract(value: &str) -> String {
     value
         .lines()
@@ -3547,6 +3675,8 @@ fn normalize_inline_extract(value: &str) -> String {
         .join("\n\n")
 }
 
+/// Builds one-button-per-row article keyboards, including size and
+/// disambiguation markers.
 fn article_results_keyboard(
     language: &str,
     results: &[ArticleButton],
@@ -3598,6 +3728,7 @@ fn article_results_keyboard(
         .collect()
 }
 
+/// Builds the favorite category keyboard shown in help/start responses.
 fn favorite_categories_keyboard(favorites: &[FavoriteCategory]) -> Option<Value> {
     if favorites.is_empty() {
         return None;
@@ -3624,6 +3755,7 @@ fn favorite_categories_keyboard(favorites: &[FavoriteCategory]) -> Option<Value>
     Some(json!({ "inline_keyboard": rows }))
 }
 
+/// Builds category search result buttons.
 fn category_search_keyboard(language: &str, categories: &[Category]) -> Option<Value> {
     let rows = category_buttons_rows(language, categories, None);
     if rows.is_empty() {
@@ -3633,6 +3765,7 @@ fn category_search_keyboard(language: &str, categories: &[Category]) -> Option<V
     Some(json!({ "inline_keyboard": rows }))
 }
 
+/// Builds subcategory buttons plus optional pagination controls.
 fn category_subcategories_keyboard_with_pagination(
     language: &str,
     subcategories: &[Category],
@@ -3651,6 +3784,7 @@ fn category_subcategories_keyboard_with_pagination(
     Some(json!({ "inline_keyboard": rows }))
 }
 
+/// Chooses Telegram button style hints based on subcategory count.
 fn subcategory_button_style(count: usize) -> Option<&'static str> {
     if count > 10 {
         Some("danger")
@@ -3661,6 +3795,7 @@ fn subcategory_button_style(count: usize) -> Option<&'static str> {
     }
 }
 
+/// Builds rows of category callback buttons.
 fn category_buttons_rows(
     language: &str,
     categories: &[Category],
@@ -3694,6 +3829,7 @@ fn category_buttons_rows(
         .collect::<Vec<_>>()
 }
 
+/// Builds article category buttons for a source article.
 fn article_categories_keyboard(
     language: &str,
     page_id: u64,
@@ -3718,6 +3854,7 @@ fn article_categories_keyboard(
     Some(json!({ "inline_keyboard": rows }))
 }
 
+/// Builds category article buttons plus optional pagination controls.
 fn category_articles_keyboard(
     language: &str,
     articles: &[ArticleButton],
@@ -3747,6 +3884,7 @@ struct CategoryPagination<'a> {
     has_next: bool,
 }
 
+/// Appends a Prev/Next row to category member keyboards.
 fn with_category_pagination_row(
     mut rows: Vec<Vec<Value>>,
     pagination: Option<CategoryPagination<'_>>,
@@ -3757,6 +3895,7 @@ fn with_category_pagination_row(
     rows
 }
 
+/// Builds Prev/Next buttons for paginated category pages.
 fn category_pagination_row(pagination: CategoryPagination<'_>) -> Option<Vec<Value>> {
     let mut row = Vec::new();
     if pagination.page_index > 0
@@ -3791,6 +3930,8 @@ fn category_pagination_row(pagination: CategoryPagination<'_>) -> Option<Vec<Val
     (!row.is_empty()).then_some(row)
 }
 
+/// Builds one category callback button, falling back to article-local category
+/// callbacks if the title is too long for Telegram callback data.
 fn category_button(language: &str, page_id: u64, index: usize, category: &Category) -> Value {
     let title = &category.title;
     let text = truncate_for_telegram(&category_display_title(title), TELEGRAM_MAX_BUTTON_TEXT);
@@ -3810,6 +3951,7 @@ fn category_button(language: &str, page_id: u64, index: usize, category: &Catego
     button
 }
 
+/// Chooses Telegram button style hints based on article counts in a category.
 fn article_category_button_style(article_count: Option<usize>) -> Option<&'static str> {
     match article_count {
         Some(1) => Some("primary"),
@@ -3818,6 +3960,7 @@ fn article_category_button_style(article_count: Option<usize>) -> Option<&'stati
     }
 }
 
+/// Builds the Wikidata button shown in article metadata.
 fn wikidata_metadata_keyboard(metadata: &ArticleMetadata) -> Option<Value> {
     let item = metadata.info.page_props.get("wikibase_item")?;
     let callback_data = wikidata_callback_data(&metadata.language, item)?;
@@ -3843,6 +3986,7 @@ fn wikidata_metadata_keyboard(metadata: &ArticleMetadata) -> Option<Value> {
     Some(json!({ "inline_keyboard": [[button]] }))
 }
 
+/// Chooses Telegram button style hints for Wikidata property counts.
 fn wikidata_property_button_style(property_count: Option<usize>) -> Option<&'static str> {
     match property_count {
         Some(count) if count < 5 => Some("primary"),
@@ -3851,12 +3995,14 @@ fn wikidata_property_button_style(property_count: Option<usize>) -> Option<&'sta
     }
 }
 
+/// Encodes a Wikidata callback payload within Telegram's callback size limits.
 fn wikidata_callback_data(language: &str, item: &str) -> Option<String> {
     let item = normalize_wikidata_entity_id(item)?;
     let data = format!("wikidata:{language}:{item}");
     (data.len() <= 64).then_some(data)
 }
 
+/// Encodes category pagination callback data.
 fn category_page_callback_data(
     language: &str,
     page_id: u64,
@@ -3878,6 +4024,7 @@ fn category_page_callback_data(
     (data.len() <= 64).then_some(data)
 }
 
+/// Builds the button that lets users request article images on demand.
 fn article_images_keyboard(language: &str, page_id: u64, image_count: usize) -> Option<Value> {
     if image_count == 0 {
         return None;
@@ -3895,22 +4042,26 @@ fn article_images_keyboard(language: &str, page_id: u64, image_count: usize) -> 
     Some(json!({ "inline_keyboard": [[button]] }))
 }
 
+/// Encodes article image callback data.
 fn article_images_callback_data(language: &str, page_id: u64) -> Option<String> {
     let language = normalize_language_code(language)?;
     let data = format!("images:{language}:{page_id}");
     (data.len() <= 64).then_some(data)
 }
 
+/// Encodes category title callback data with base64url to keep separators safe.
 fn category_title_callback_data(language: &str, title: &str) -> Option<String> {
     let encoded = URL_SAFE_NO_PAD.encode(normalize_category_title_for_language(title, language));
     let data = format!("category:{language}:{encoded}");
     (data.len() <= 64).then_some(data)
 }
 
+/// Encodes an article-local category index callback.
 fn article_category_callback_data(language: &str, page_id: u64, index: usize) -> String {
     format!("article_category:{language}:{page_id}:{index}")
 }
 
+/// Builds a canonical Wikipedia article URL for a title.
 fn article_url(language: &str, title: &str) -> String {
     format!(
         "https://{language}.wikipedia.org/wiki/{}",
@@ -3918,6 +4069,7 @@ fn article_url(language: &str, title: &str) -> String {
     )
 }
 
+/// Renders an article into Telegram HTML message chunks.
 #[cfg(test)]
 fn render_article_html_parts(
     language: &str,
@@ -3939,6 +4091,8 @@ enum ArticleOutputPart {
     Images(Vec<MediaItem>),
 }
 
+/// Renders article output into text and inline image parts so images can be sent
+/// between section messages.
 fn render_article_output_parts(
     language: &str,
     article: &ArticleContent,
@@ -4027,6 +4181,7 @@ fn render_article_output_parts(
     parts
 }
 
+/// Renders one article section into Telegram-sized message chunks.
 fn render_article_body_section_parts(
     language: &str,
     article_title: &str,
@@ -4059,6 +4214,8 @@ fn render_article_body_section_parts(
     parts
 }
 
+/// Builds the clickable article/section prefix used at the start of each
+/// article body chunk.
 fn render_article_body_section_prefix(
     language: &str,
     article_title: &str,
@@ -4079,6 +4236,7 @@ fn render_article_body_section_prefix(
     }
 }
 
+/// Builds the section URL, including a fragment when MediaWiki exposes one.
 fn article_body_section_url(language: &str, article_title: &str, anchor: Option<&str>) -> String {
     let url = article_url(language, article_title);
     anchor
@@ -4086,6 +4244,7 @@ fn article_body_section_url(language: &str, article_title: &str, anchor: Option<
         .unwrap_or(url)
 }
 
+/// Renders article categories as one clickable category link per line.
 fn render_categories_html(language: &str, categories: &[Category]) -> String {
     let category_names = categories
         .iter()
@@ -4101,6 +4260,7 @@ fn render_categories_html(language: &str, categories: &[Category]) -> String {
     format!("{}\n{}", html_bold("Categories"), category_names)
 }
 
+/// Renders parent categories for a category page.
 fn render_parent_categories_html(language: &str, title: &str, categories: &[Category]) -> String {
     let category_names = categories
         .iter()
@@ -4122,6 +4282,7 @@ fn render_parent_categories_html(language: &str, title: &str, categories: &[Cate
     )
 }
 
+/// Renders clickable names for category search results.
 fn render_category_search_html(language: &str, query: &str, categories: &[Category]) -> String {
     let category_names = categories
         .iter()
@@ -4140,6 +4301,7 @@ fn render_category_search_html(language: &str, query: &str, categories: &[Catego
     )
 }
 
+/// Renders category descriptions into Telegram-sized HTML chunks.
 fn render_category_description_html_parts(
     language: &str,
     title: &str,
@@ -4152,6 +4314,7 @@ fn render_category_description_html_parts(
     combine_html_sections(vec![format!("{heading}\n\n{description}")], limit)
 }
 
+/// Renders a subcategory page heading with optional page count.
 fn render_category_subcategories_page_heading_html(
     language: &str,
     title: &str,
@@ -4161,6 +4324,7 @@ fn render_category_subcategories_page_heading_html(
     render_category_page_heading_html(language, title, "Subcategories in", page_index, total_pages)
 }
 
+/// Renders a category article page heading with optional page count.
 fn render_category_articles_page_heading_html(
     language: &str,
     title: &str,
@@ -4176,6 +4340,7 @@ fn render_category_articles_page_heading_html(
     )
 }
 
+/// Renders a category page heading with a clickable category title.
 fn render_category_page_heading_html(
     language: &str,
     title: &str,
@@ -4198,11 +4363,13 @@ fn render_category_page_heading_html(
     }
 }
 
+/// Converts item counts and page size into a total page count.
 fn category_total_pages(total_items: Option<usize>, page_size: usize) -> Option<usize> {
     let page_size = page_size.clamp(1, MAX_SEARCH_LIMIT);
     total_items.map(|total_items| total_items.div_ceil(page_size))
 }
 
+/// Splits rendered reference HTML into Telegram-sized messages.
 fn render_references_html_parts(references_html: &str, limit: usize) -> Vec<String> {
     combine_html_sections(
         vec![format!("{}\n{}", html_bold("References"), references_html)],
@@ -4210,6 +4377,8 @@ fn render_references_html_parts(references_html: &str, limit: usize) -> Vec<Stri
     )
 }
 
+/// Renders a navigation template heading, linking the template title when
+/// possible.
 fn render_navigation_heading_html(template: &NavTemplateButtons) -> String {
     if let Some(url) = template.title_url.as_deref() {
         format!(
@@ -4222,6 +4391,7 @@ fn render_navigation_heading_html(template: &NavTemplateButtons) -> String {
     }
 }
 
+/// Renders an infobox under a conservative per-article length cap.
 fn render_infobox_html(infobox: &str, limit: usize) -> String {
     split_html_lines_for_telegram(infobox, limit)
         .into_iter()
@@ -4239,6 +4409,7 @@ fn render_infobox_html(infobox: &str, limit: usize) -> String {
         .join("\n")
 }
 
+/// Combines logical HTML sections into Telegram-sized message chunks.
 fn combine_html_sections(sections: Vec<String>, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     let mut parts = Vec::new();
@@ -4271,10 +4442,12 @@ fn combine_html_sections(sections: Vec<String>, limit: usize) -> Vec<String> {
     parts
 }
 
+/// Escapes and wraps text in Telegram-compatible bold tags.
 fn html_bold(value: &str) -> String {
     format!("<b>{}</b>", html_escape_text(value))
 }
 
+/// Builds a Telegram-compatible HTML link.
 fn html_link(url: &str, text: &str) -> String {
     format!(
         "<a href=\"{}\">{}</a>",
@@ -4283,6 +4456,7 @@ fn html_link(url: &str, text: &str) -> String {
     )
 }
 
+/// Builds a bold Telegram HTML link.
 fn html_bold_link(url: &str, text: &str) -> String {
     format!(
         "<b><a href=\"{}\">{}</a></b>",
@@ -4291,6 +4465,7 @@ fn html_bold_link(url: &str, text: &str) -> String {
     )
 }
 
+/// Builds an italic Telegram HTML link.
 fn html_italic_link(url: &str, text: &str) -> String {
     format!(
         "<i><a href=\"{}\">{}</a></i>",
@@ -4299,10 +4474,12 @@ fn html_italic_link(url: &str, text: &str) -> String {
     )
 }
 
+/// Escapes text for Telegram HTML.
 fn html_escape_text(value: &str) -> String {
     html_escape::encode_text(value).to_string()
 }
 
+/// Normalizes image captions before sending them to Telegram.
 fn caption_html_for_telegram(caption: &str) -> String {
     if caption.chars().count() <= 1024 {
         caption.to_string()
@@ -4311,6 +4488,7 @@ fn caption_html_for_telegram(caption: &str) -> String {
     }
 }
 
+/// Adds a caption to a Telegram media payload when one is available.
 fn add_media_caption_payload(payload: &mut Value, image: &MediaItem) {
     if let Some(caption) = image.caption.as_ref() {
         payload["caption"] = Value::String(caption_html_for_telegram(caption));
@@ -4318,6 +4496,7 @@ fn add_media_caption_payload(payload: &mut Value, image: &MediaItem) {
     }
 }
 
+/// Converts MediaWiki HTML into one Telegram HTML body string.
 #[cfg(test)]
 fn mediawiki_html_to_telegram_html(language: &str, title: &str, html: &str) -> Option<String> {
     article_body_sections_to_html(
@@ -4327,6 +4506,7 @@ fn mediawiki_html_to_telegram_html(language: &str, title: &str, html: &str) -> O
     )
 }
 
+/// Joins parsed article sections into the legacy single-body representation.
 fn article_body_sections_to_html(
     language: &str,
     title: &str,
@@ -4349,6 +4529,7 @@ fn article_body_sections_to_html(
     (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
+/// Renders an article heading as clickable Telegram HTML.
 fn article_body_heading_html(
     language: &str,
     article_title: &str,
@@ -4366,6 +4547,8 @@ fn article_body_heading_html(
         .unwrap_or_else(|| html_bold(&heading.title))
 }
 
+/// Converts MediaWiki HTML into article sections with headings and inline
+/// images.
 fn mediawiki_html_to_telegram_sections(
     language: &str,
     _title: &str,
@@ -4386,6 +4569,7 @@ struct ArticleBodySectionBuilder {
 }
 
 impl ArticleBodySectionBuilder {
+    /// Creates an empty article section collector.
     fn new() -> Self {
         Self {
             sections: Vec::new(),
@@ -4395,24 +4579,29 @@ impl ArticleBodySectionBuilder {
         }
     }
 
+    /// Adds a rendered block to the current section.
     fn push_block(&mut self, block: String) {
         self.current_blocks.push(block);
     }
 
+    /// Adds an image to the current section so it can be sent after that text.
     fn push_image(&mut self, image: MediaItem) {
         push_unique_media_item(&mut self.current_images, image);
     }
 
+    /// Starts a new article section.
     fn start_section(&mut self, heading: ArticleBodyHeading) {
         self.flush();
         self.current_heading = Some(heading);
     }
 
+    /// Flushes the current section and returns all collected sections.
     fn finish(mut self) -> Vec<ArticleBodySection> {
         self.flush();
         self.sections
     }
 
+    /// Flushes the current section if it contains text or images.
     fn flush(&mut self) {
         if self.current_blocks.is_empty() && self.current_images.is_empty() {
             return;
@@ -4427,6 +4616,7 @@ impl ArticleBodySectionBuilder {
     }
 }
 
+/// Extracts references into a separate Telegram HTML message body.
 fn mediawiki_references_to_telegram_html(language: &str, html: &str) -> Option<String> {
     let document = Html::parse_fragment(html);
     let selector = Selector::parse("ol.references li").expect("references selector is valid");
@@ -4440,6 +4630,8 @@ fn mediawiki_references_to_telegram_html(language: &str, html: &str) -> Option<S
     (!lines.is_empty()).then(|| lines.join("\n\n"))
 }
 
+/// Detects MediaWiki disambiguation pages from page properties or fallback HTML
+/// markers.
 fn is_disambiguation_page(parsed: &ParsedPage, html: &str) -> bool {
     parsed
         .properties
@@ -4449,6 +4641,7 @@ fn is_disambiguation_page(parsed: &ParsedPage, html: &str) -> bool {
         || html.contains("dmbox-disambig")
 }
 
+/// Extracts disambiguation target links grouped by section heading.
 fn mediawiki_disambiguation_link_groups(
     language: &str,
     html: &str,
@@ -4497,6 +4690,7 @@ fn mediawiki_disambiguation_link_groups(
     groups
 }
 
+/// Skips page chrome and helper boxes while walking disambiguation HTML.
 fn should_skip_disambiguation_element(element: ElementRef<'_>) -> bool {
     element_or_ancestor_has_class_part(
         element,
@@ -4514,6 +4708,7 @@ fn should_skip_disambiguation_element(element: ElementRef<'_>) -> bool {
     )
 }
 
+/// Extracts a clean section heading for disambiguation button groups.
 fn disambiguation_heading_text(language: &str, heading: ElementRef<'_>) -> Option<String> {
     let rendered = trim_html_spacing(&render_inline_element(language, heading));
     let title = html_to_plain_text(&rendered);
@@ -4521,6 +4716,7 @@ fn disambiguation_heading_text(language: &str, heading: ElementRef<'_>) -> Optio
     (!title.is_empty() && !is_terminal_article_heading(&title)).then_some(title)
 }
 
+/// Extracts the first usable target link from a disambiguation list item.
 fn disambiguation_link_from_list_item(
     language: &str,
     item: ElementRef<'_>,
@@ -4559,6 +4755,7 @@ fn disambiguation_link_from_list_item(
     })
 }
 
+/// Appends a disambiguation link to the current group or starts a new group.
 fn push_disambiguation_link_group(
     groups: &mut Vec<DisambiguationLinkGroup>,
     title: &str,
@@ -4577,6 +4774,8 @@ fn push_disambiguation_link_group(
     });
 }
 
+/// Extracts the first internal article-body links for a follow-up buttons
+/// message.
 fn mediawiki_body_links(language: &str, article_title: &str, html: &str) -> Vec<NavLink> {
     let document = Html::parse_fragment(html);
     let selector = Selector::parse("a[href]").expect("body link selector is valid");
@@ -4644,6 +4843,7 @@ fn mediawiki_body_links(language: &str, article_title: &str, html: &str) -> Vec<
     links
 }
 
+/// Extracts navbox/sidebar templates and their internal article links.
 fn mediawiki_nav_templates(language: &str, html: &str) -> Vec<NavTemplate> {
     let document = Html::parse_fragment(html);
     let selector =
@@ -4705,6 +4905,7 @@ fn mediawiki_nav_templates(language: &str, html: &str) -> Vec<NavTemplate> {
     templates
 }
 
+/// Extracts the displayed title for a navigation template.
 fn nav_template_title(language: &str, template: ElementRef<'_>) -> Option<NavTemplateTitle> {
     let title_selector = Selector::parse(
         ".navbox-title, th.navbox-title, .sidebar-title, .sidebar-heading, .vertical-navbox-title",
@@ -4732,6 +4933,7 @@ struct NavTemplateTitle {
     url: Option<String>,
 }
 
+/// Finds a usable link target for a navigation template title.
 fn nav_template_title_url(language: &str, title_element: ElementRef<'_>) -> Option<String> {
     let link_selector = Selector::parse("a[href]").expect("nav title link selector is valid");
     title_element.select(&link_selector).find_map(|link| {
@@ -4750,6 +4952,7 @@ fn nav_template_title_url(language: &str, title_element: ElementRef<'_>) -> Opti
     })
 }
 
+/// Converts an internal `/wiki/...` href into a namespace-free article title.
 fn wiki_article_title_from_href(href: &str) -> Option<String> {
     let path = href.trim().strip_prefix("/wiki/")?;
     if path.is_empty() || path.contains('#') {
@@ -4765,6 +4968,7 @@ fn wiki_article_title_from_href(href: &str) -> Option<String> {
     Some(title)
 }
 
+/// Normalizes titles for deduplication and lookup map keys.
 fn normalized_title_key(title: &str) -> String {
     title
         .replace('_', " ")
@@ -4774,12 +4978,14 @@ fn normalized_title_key(title: &str) -> String {
         .to_lowercase()
 }
 
+/// Checks MediaWiki pageprops for the disambiguation marker.
 fn info_page_is_disambiguation(page: &InfoPage) -> bool {
     page.pageprops
         .as_ref()
         .is_some_and(|props| props.contains_key("disambiguation"))
 }
 
+/// Renders one reference list item with visible links.
 fn render_reference_item(language: &str, item: ElementRef<'_>) -> Option<String> {
     let mut text = String::new();
     let mut links = Vec::new();
@@ -4797,6 +5003,7 @@ fn render_reference_item(language: &str, item: ElementRef<'_>) -> Option<String>
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+/// Recursively renders reference content and collects links found in it.
 fn render_reference_node(
     language: &str,
     node: NodeRef<'_, Node>,
@@ -4835,6 +5042,7 @@ fn render_reference_node(
     }
 }
 
+/// Skips inline elements that are not useful in reference output.
 fn should_skip_reference_inline(element: ElementRef<'_>) -> bool {
     let name = element.value().name();
     matches!(
@@ -4846,12 +5054,15 @@ fn should_skip_reference_inline(element: ElementRef<'_>) -> bool {
     )
 }
 
+/// Pushes a link if it has not already been collected.
 fn push_unique_link(links: &mut Vec<String>, url: String) {
     if !links.iter().any(|link| link == &url) {
         links.push(url);
     }
 }
 
+/// Walks block-level MediaWiki HTML and appends Telegram-renderable blocks to
+/// article sections.
 fn collect_html_blocks(
     language: &str,
     element: ElementRef<'_>,
@@ -4925,6 +5136,7 @@ fn collect_html_blocks(
     }
 }
 
+/// Collects image tags from a figure into the current article section.
 fn collect_html_images(
     language: &str,
     element: ElementRef<'_>,
@@ -4938,6 +5150,8 @@ fn collect_html_images(
     }
 }
 
+/// Converts an HTML image element into a media item when it is likely article
+/// content.
 fn media_item_from_html_image(language: &str, image: ElementRef<'_>) -> Option<MediaItem> {
     if element_or_ancestor_has_class_part(
         image,
@@ -4991,10 +5205,12 @@ fn media_item_from_html_image(language: &str, image: ElementRef<'_>) -> Option<M
     is_gallery_image(&item).then_some(item)
 }
 
+/// Parses a positive integer HTML attribute.
 fn parse_u64_attr(value: &str) -> Option<u64> {
     value.trim().parse::<u64>().ok()
 }
 
+/// Finds an image caption near the image element.
 fn image_caption_from_ancestor(language: &str, image: ElementRef<'_>) -> Option<String> {
     let caption_selector = Selector::parse("figcaption").expect("figcaption selector is valid");
     image
@@ -5006,6 +5222,7 @@ fn image_caption_from_ancestor(language: &str, image: ElementRef<'_>) -> Option<
         .filter(|caption| !caption.is_empty())
 }
 
+/// Extracts the MediaWiki anchor ID attached to a heading.
 fn element_anchor_id(element: ElementRef<'_>) -> Option<String> {
     if let Some(id) = element.value().attr("id").filter(|id| !id.is_empty()) {
         return Some(id.to_string());
@@ -5028,6 +5245,7 @@ fn element_anchor_id(element: ElementRef<'_>) -> Option<String> {
     None
 }
 
+/// Renders ordered or unordered lists into simple Telegram HTML lines.
 fn render_list(language: &str, element: ElementRef<'_>, ordered: bool) -> String {
     let mut lines = Vec::new();
     let mut index = 1usize;
@@ -5056,6 +5274,7 @@ fn render_list(language: &str, element: ElementRef<'_>, ordered: bool) -> String
     lines.join("\n")
 }
 
+/// Renders a MediaWiki table as a monospace text table plus visible links.
 fn render_table(language: &str, table: ElementRef<'_>) -> String {
     let mut rows = Vec::new();
     collect_table_rows(table, &mut rows);
@@ -5075,6 +5294,7 @@ fn render_table(language: &str, table: ElementRef<'_>) -> String {
         .join("\n")
 }
 
+/// Recursively collects table rows from nested table sections.
 fn collect_table_rows<'a>(element: ElementRef<'a>, rows: &mut Vec<ElementRef<'a>>) {
     for child in element.children() {
         let Some(child_element) = ElementRef::wrap(child) else {
@@ -5088,6 +5308,7 @@ fn collect_table_rows<'a>(element: ElementRef<'a>, rows: &mut Vec<ElementRef<'a>
     }
 }
 
+/// Renders one table row into plain text cells.
 fn render_table_row(
     language: &str,
     row: ElementRef<'_>,
@@ -5121,6 +5342,7 @@ fn render_table_row(
     (!cells.is_empty()).then_some(cells)
 }
 
+/// Reads a table cell colspan, defaulting to one column.
 fn cell_colspan(cell: ElementRef<'_>) -> usize {
     cell.value()
         .attr("colspan")
@@ -5130,6 +5352,7 @@ fn cell_colspan(cell: ElementRef<'_>) -> usize {
         .unwrap_or(1)
 }
 
+/// Aligns plain text table rows for a Telegram `<pre>` block.
 fn format_plain_text_table(rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
         return String::new();
@@ -5166,6 +5389,7 @@ fn format_plain_text_table(rows: &[Vec<String>]) -> String {
     )
 }
 
+/// Pads a string by visible character count.
 fn pad_right_chars(value: &str, width: usize) -> String {
     let count = value.chars().count();
     if count >= width {
@@ -5184,6 +5408,7 @@ struct TableLink {
     url: String,
 }
 
+/// Collects links that were present inside a rendered table.
 fn collect_table_links(language: &str, element: ElementRef<'_>, links: &mut Vec<TableLink>) {
     if element.value().name() == "a"
         && let Some(url) = element
@@ -5205,6 +5430,7 @@ fn collect_table_links(language: &str, element: ElementRef<'_>, links: &mut Vec<
     }
 }
 
+/// Formats collected table links under the table block.
 fn format_table_links(links: &[TableLink]) -> String {
     if links.is_empty() {
         return String::new();
@@ -5218,18 +5444,21 @@ fn format_table_links(links: &[TableLink]) -> String {
     format!("{}\n{}", html_bold("Table links"), links)
 }
 
+/// Renders an element's inline children to Telegram-compatible HTML.
 fn render_inline_element(language: &str, element: ElementRef<'_>) -> String {
     let mut out = String::new();
     render_inline_children(language, element, &mut out);
     trim_html_spacing(&out)
 }
 
+/// Renders inline child nodes into an existing output buffer.
 fn render_inline_children(language: &str, element: ElementRef<'_>, out: &mut String) {
     for child in element.children() {
         render_inline_node(language, child, out);
     }
 }
 
+/// Renders one inline HTML node, preserving Telegram-supported formatting.
 fn render_inline_node(language: &str, node: NodeRef<'_, Node>, out: &mut String) {
     match node.value() {
         Node::Text(text) => append_collapsed_text(out, text.as_ref()),
@@ -5276,6 +5505,7 @@ fn render_inline_node(language: &str, node: NodeRef<'_, Node>, out: &mut String)
     }
 }
 
+/// Renders a supported inline wrapper tag if it contains non-empty text.
 fn render_inline_wrapped(language: &str, element: ElementRef<'_>, out: &mut String, tag: &str) {
     let inner = render_inline_element(language, element);
     if !inner.is_empty() {
@@ -5283,6 +5513,7 @@ fn render_inline_wrapped(language: &str, element: ElementRef<'_>, out: &mut Stri
     }
 }
 
+/// Skips block elements that are page chrome, references, or unsupported media.
 fn should_skip_block(element: ElementRef<'_>) -> bool {
     let name = element.value().name();
     matches!(
@@ -5308,6 +5539,7 @@ fn should_skip_block(element: ElementRef<'_>) -> bool {
         )
 }
 
+/// Detects climate/weather tables that are too wide to be useful in chat.
 fn is_climate_data_table(table: ElementRef<'_>) -> bool {
     if element_has_class_part(table, &["weatherbox", "climate"]) {
         return true;
@@ -5327,6 +5559,7 @@ fn is_climate_data_table(table: ElementRef<'_>) -> bool {
         && (lower.contains("record high") || lower.contains("daily mean"))
 }
 
+/// Skips inline elements that Telegram should not receive.
 fn should_skip_inline(element: ElementRef<'_>) -> bool {
     let name = element.value().name();
     matches!(
@@ -5343,6 +5576,7 @@ fn should_skip_inline(element: ElementRef<'_>) -> bool {
     )
 }
 
+/// Checks whether an element's class list contains any configured substring.
 fn element_has_class_part(element: ElementRef<'_>, needles: &[&str]) -> bool {
     element.value().attr("class").is_some_and(|classes| {
         classes.split_whitespace().any(|class| {
@@ -5352,6 +5586,7 @@ fn element_has_class_part(element: ElementRef<'_>, needles: &[&str]) -> bool {
     })
 }
 
+/// Checks an element and its ancestors for class substrings.
 fn element_or_ancestor_has_class_part(element: ElementRef<'_>, needles: &[&str]) -> bool {
     element_has_class_part(element, needles)
         || element
@@ -5360,6 +5595,7 @@ fn element_or_ancestor_has_class_part(element: ElementRef<'_>, needles: &[&str])
             .any(|ancestor| element_has_class_part(ancestor, needles))
 }
 
+/// Converts internal and protocol-relative wiki hrefs into absolute URLs.
 fn normalize_wiki_href(language: &str, href: &str) -> Option<String> {
     let href = href.trim();
     if href.is_empty()
@@ -5389,6 +5625,7 @@ fn normalize_wiki_href(language: &str, href: &str) -> Option<String> {
     None
 }
 
+/// Appends text while collapsing whitespace to Telegram-friendly spacing.
 fn append_collapsed_text(out: &mut String, text: &str) {
     let has_leading_space = text.chars().next().is_some_and(char::is_whitespace);
     let has_trailing_space = text.chars().last().is_some_and(char::is_whitespace);
@@ -5410,12 +5647,14 @@ fn append_collapsed_text(out: &mut String, text: &str) {
     }
 }
 
+/// Appends at most one space unless the output already ends at a boundary.
 fn append_single_space(out: &mut String) {
     if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
         out.push(' ');
     }
 }
 
+/// Normalizes spacing around punctuation and newlines after HTML rendering.
 fn trim_html_spacing(value: &str) -> String {
     value
         .lines()
@@ -5427,10 +5666,12 @@ fn trim_html_spacing(value: &str) -> String {
         .to_string()
 }
 
+/// Converts Telegram HTML fragments back to plain text.
 fn html_to_plain_text(value: &str) -> String {
     html_to_text(value)
 }
 
+/// Identifies terminal article sections that should not start body output.
 fn is_terminal_article_heading(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -5438,6 +5679,7 @@ fn is_terminal_article_heading(value: &str) -> bool {
     )
 }
 
+/// Chooses a shorter infobox cap for very large articles.
 fn article_infobox_limit(article_length: Option<usize>) -> usize {
     if article_length.is_some_and(|length| length > 50_000) {
         1400
@@ -5446,6 +5688,7 @@ fn article_infobox_limit(article_length: Option<usize>) -> usize {
     }
 }
 
+/// Renders article metadata as Telegram HTML.
 fn render_metadata_html(metadata: &ArticleMetadata) -> String {
     let info = &metadata.info;
     let mut lines = Vec::new();
@@ -5587,6 +5830,7 @@ fn render_metadata_html(metadata: &ArticleMetadata) -> String {
     lines.join("\n")
 }
 
+/// Renders Wikidata claims into Telegram-sized HTML messages.
 fn render_wikidata_claims_html_parts(claims: &WikidataClaims, limit: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let title = claims
@@ -5638,6 +5882,7 @@ fn render_wikidata_claims_html_parts(claims: &WikidataClaims, limit: usize) -> V
     split_html_lines_for_telegram(&lines.join("\n"), limit)
 }
 
+/// Renders metadata for the Wikidata entity page itself.
 fn render_wikidata_page_metadata_html(metadata: &WikidataPageMetadata) -> String {
     let mut lines = Vec::new();
     lines.push(html_bold(&format!(
@@ -5705,6 +5950,8 @@ fn render_wikidata_page_metadata_html(metadata: &WikidataPageMetadata) -> String
     lines.join("\n")
 }
 
+/// Converts one Wikidata snak value into clickable user-facing text when
+/// possible.
 fn render_wikidata_snak_value(
     property_id: &str,
     snak: &WikidataSnak,
@@ -5761,6 +6008,7 @@ fn render_wikidata_snak_value(
     )))
 }
 
+/// Formats a Wikidata globe-coordinate value as a clickable map link.
 fn wikidata_coordinate_value(value: &serde_json::Map<String, Value>) -> Option<String> {
     let lat = value.get("latitude")?.as_f64()?;
     let lon = value.get("longitude")?.as_f64()?;
@@ -5770,6 +6018,7 @@ fn wikidata_coordinate_value(value: &serde_json::Map<String, Value>) -> Option<S
     ))
 }
 
+/// Formats a Wikidata time value, preserving simple precision when possible.
 fn wikidata_time_value(value: &serde_json::Map<String, Value>) -> Option<String> {
     let raw = value.get("time")?.as_str()?;
     let mut formatted = raw.trim_start_matches('+').to_string();
@@ -5782,6 +6031,7 @@ fn wikidata_time_value(value: &serde_json::Map<String, Value>) -> Option<String>
     (!formatted.is_empty()).then(|| html_escape_text(&formatted))
 }
 
+/// Formats a Wikidata quantity value and optional unit entity.
 fn wikidata_quantity_value(
     value: &serde_json::Map<String, Value>,
     labels: &HashMap<String, WikidataLabelInfo>,
@@ -5800,6 +6050,7 @@ fn wikidata_quantity_value(
     Some(format!("{} {}", html_escape_text(amount), unit))
 }
 
+/// Formats a Wikidata monolingual text value.
 fn wikidata_monolingual_text_value(value: &serde_json::Map<String, Value>) -> Option<String> {
     let text = value.get("text")?.as_str()?;
     let language = value.get("language").and_then(Value::as_str);
@@ -5813,6 +6064,7 @@ fn wikidata_monolingual_text_value(value: &serde_json::Map<String, Value>) -> Op
     })
 }
 
+/// Expands a Wikidata external-id formatter URL.
 fn wikidata_external_id_url(formatter: &str, value: &str) -> Option<String> {
     let formatter = formatter.trim();
     let value = value.trim();
@@ -5824,6 +6076,7 @@ fn wikidata_external_id_url(formatter: &str, value: &str) -> Option<String> {
     is_absolute_url(&url).then_some(url)
 }
 
+/// Renders a Wikidata entity ID as a clickable label.
 fn wikidata_entity_link(entity_id: &str, labels: &HashMap<String, WikidataLabelInfo>) -> String {
     let text = wikidata_label_text(labels, entity_id)
         .filter(|label| label != entity_id)
@@ -5832,6 +6085,7 @@ fn wikidata_entity_link(entity_id: &str, labels: &HashMap<String, WikidataLabelI
     html_link(&wikidata_entity_url(entity_id), &text)
 }
 
+/// Returns the best known label for a Wikidata entity.
 fn wikidata_label_text(
     labels: &HashMap<String, WikidataLabelInfo>,
     entity_id: &str,
@@ -5839,6 +6093,7 @@ fn wikidata_label_text(
     labels.get(entity_id).and_then(|label| label.label.clone())
 }
 
+/// Returns the best known description for a Wikidata entity.
 fn wikidata_description_text(
     labels: &HashMap<String, WikidataLabelInfo>,
     entity_id: &str,
@@ -5848,12 +6103,14 @@ fn wikidata_description_text(
         .and_then(|label| label.description.clone())
 }
 
+/// Extracts an entity ID from a Wikidata snak.
 fn wikidata_entity_id_from_snak(snak: &WikidataSnak) -> Option<String> {
     snak.datavalue
         .as_ref()
         .and_then(|datavalue| wikidata_entity_id_from_value(&datavalue.value))
 }
 
+/// Extracts an entity ID from a Wikidata entity-id value object.
 fn wikidata_entity_id_from_value(value: &Value) -> Option<String> {
     if let Some(id) = value
         .get("id")
@@ -5872,6 +6129,7 @@ fn wikidata_entity_id_from_value(value: &Value) -> Option<String> {
     }
 }
 
+/// Extracts the unit entity ID from a Wikidata quantity value.
 fn wikidata_quantity_unit_id(value: &Value) -> Option<String> {
     value
         .get("unit")
@@ -5879,12 +6137,14 @@ fn wikidata_quantity_unit_id(value: &Value) -> Option<String> {
         .and_then(wikidata_entity_id_from_url)
 }
 
+/// Extracts an entity ID from a Wikidata entity URL.
 fn wikidata_entity_id_from_url(url: &str) -> Option<String> {
     url.rsplit('/')
         .next()
         .and_then(normalize_wikidata_entity_id)
 }
 
+/// Chooses a localized Wikidata label and optional description for display.
 fn wikidata_localized_entity_value(
     values: Option<&HashMap<String, WikidataLocalizedValue>>,
     language: &str,
@@ -5897,6 +6157,7 @@ fn wikidata_localized_entity_value(
         .map(|value| value.value.clone())
 }
 
+/// Normalizes Wikidata item/property IDs.
 fn normalize_wikidata_entity_id(value: &str) -> Option<String> {
     let value = value.trim();
     let mut chars = value.chars();
@@ -5909,6 +6170,7 @@ fn normalize_wikidata_entity_id(value: &str) -> Option<String> {
         .then(|| format!("{prefix}{rest}"))
 }
 
+/// Builds a Wikidata entity URL.
 fn wikidata_entity_url(entity_id: &str) -> String {
     if entity_id.starts_with('P') {
         format!("https://www.wikidata.org/wiki/Property:{entity_id}")
@@ -5917,10 +6179,12 @@ fn wikidata_entity_url(entity_id: &str) -> String {
     }
 }
 
+/// Builds the Wikidata action=info URL for an entity page.
 fn wikidata_action_info_url(item: &str) -> String {
     format!("https://www.wikidata.org/w/index.php?title={item}&action=info")
 }
 
+/// Builds a Wikidata old revision URL.
 fn wikidata_revision_link(revision_id: u64) -> String {
     html_link(
         &format!("https://www.wikidata.org/w/index.php?oldid={revision_id}"),
@@ -5928,6 +6192,7 @@ fn wikidata_revision_link(revision_id: u64) -> String {
     )
 }
 
+/// Builds a Wikidata user page URL.
 fn wikidata_user_link(user: Option<&str>) -> String {
     let Some(user) = user.map(str::trim).filter(|user| {
         !user.is_empty() && !user.starts_with("http://") && !user.starts_with("https://")
@@ -5944,6 +6209,7 @@ fn wikidata_user_link(user: Option<&str>) -> String {
     )
 }
 
+/// Builds a Wikimedia Commons file URL.
 fn commons_file_url(file: &str) -> String {
     let file = file.trim();
     let title = if file.to_ascii_lowercase().starts_with("file:") {
@@ -5954,10 +6220,12 @@ fn commons_file_url(file: &str) -> String {
     commons_title_url(&title)
 }
 
+/// Checks whether a value is already an absolute HTTP URL.
 fn is_absolute_url(value: &str) -> bool {
     value.starts_with("https://") || value.starts_with("http://")
 }
 
+/// Builds a Wikipedia old revision URL.
 fn revision_link(language: &str, revision_id: u64) -> String {
     html_link(
         &format!("https://{language}.wikipedia.org/w/index.php?oldid={revision_id}"),
@@ -5965,6 +6233,7 @@ fn revision_link(language: &str, revision_id: u64) -> String {
     )
 }
 
+/// Builds a Wikimedia Pageviews UI URL for the last 30 days.
 fn pageviews_url(language: &str, title: &str) -> String {
     format!(
         "https://pageviews.wmcloud.org/pageviews/?project={language}.wikipedia.org&platform=all-access&agent=user&redirects=0&range=latest-30&pages={}",
@@ -5972,6 +6241,7 @@ fn pageviews_url(language: &str, title: &str) -> String {
     )
 }
 
+/// Summarizes daily pageviews returned by MediaWiki.
 fn pageviews_from_map(views_by_date: Option<HashMap<String, Option<u64>>>) -> PageViews {
     let views_by_date = views_by_date.unwrap_or_default();
     PageViews {
@@ -5984,6 +6254,7 @@ fn pageviews_from_map(views_by_date: Option<HashMap<String, Option<u64>>>) -> Pa
     }
 }
 
+/// Finds a Commons page URL from article pageprops.
 fn commons_page_url(page_props: &HashMap<String, String>) -> Option<String> {
     page_props
         .get("commonscat")
@@ -5995,6 +6266,7 @@ fn commons_page_url(page_props: &HashMap<String, String>) -> Option<String> {
         })
 }
 
+/// Finds a Commons URL from Wikidata sitelinks or Commons category claims.
 fn wikidata_commons_url_from_entity(entity: &WikidataEntity) -> Option<String> {
     entity
         .sitelinks
@@ -6019,6 +6291,7 @@ fn wikidata_commons_url_from_entity(entity: &WikidataEntity) -> Option<String> {
         })
 }
 
+/// Extracts a formatter URL template from a Wikidata property entity.
 fn wikidata_formatter_url_from_entity(entity: &WikidataEntity) -> Option<String> {
     entity
         .claims
@@ -6038,6 +6311,7 @@ fn wikidata_formatter_url_from_entity(entity: &WikidataEntity) -> Option<String>
         })
 }
 
+/// Builds a Wikimedia Commons category URL.
 fn commons_category_url(category: &str) -> String {
     let category = category.trim();
     if category.to_ascii_lowercase().starts_with("category:") {
@@ -6050,6 +6324,7 @@ fn commons_category_url(category: &str) -> String {
     }
 }
 
+/// Builds a Wikimedia Commons title URL.
 fn commons_title_url(title: &str) -> String {
     format!(
         "https://commons.wikimedia.org/wiki/{}",
@@ -6057,6 +6332,7 @@ fn commons_title_url(title: &str) -> String {
     )
 }
 
+/// Builds a Wikipedia user page URL for revision metadata.
 fn revision_user_link(language: &str, user: Option<&str>) -> String {
     let Some(user) = user.map(str::trim).filter(|user| {
         !user.is_empty() && !user.starts_with("http://") && !user.starts_with("https://")
@@ -6073,6 +6349,7 @@ fn revision_user_link(language: &str, user: Option<&str>) -> String {
     )
 }
 
+/// Builds a GeoHack map URL for coordinates.
 fn coordinate_url(lat: f64, lon: f64) -> String {
     let lat_dir = if lat >= 0.0 { "N" } else { "S" };
     let lon_dir = if lon >= 0.0 { "E" } else { "W" };
@@ -6085,6 +6362,7 @@ fn coordinate_url(lat: f64, lon: f64) -> String {
     )
 }
 
+/// Parses coordinate text commonly found in infoboxes.
 fn parse_coordinate_pair(line: &str) -> Option<(f64, f64)> {
     let re = COORDINATE_DMS_RE.get_or_init(|| {
         Regex::new(
@@ -6107,6 +6385,7 @@ fn parse_coordinate_pair(line: &str) -> Option<(f64, f64)> {
     Some((lat, lon))
 }
 
+/// Converts DMS regex captures into decimal coordinates.
 fn coordinate_from_captures(
     captures: &regex::Captures<'_>,
     prefix: &str,
@@ -6128,10 +6407,12 @@ fn coordinate_from_captures(
     Some(sign * (degrees + minutes / 60.0 + seconds / 3600.0))
 }
 
+/// Reads a numeric regex capture.
 fn capture_number(captures: &regex::Captures<'_>, name: &str) -> Option<f64> {
     captures.name(name)?.as_str().parse::<f64>().ok()
 }
 
+/// Checks whether a coordinate direction is south or west.
 fn coordinate_direction_is_negative(direction: &str) -> bool {
     let direction = direction.trim().to_lowercase();
     direction.starts_with('s')
@@ -6140,6 +6421,7 @@ fn coordinate_direction_is_negative(direction: &str) -> bool {
         || direction.starts_with('з')
 }
 
+/// Splits plain text into Telegram-sized chunks.
 #[cfg(test)]
 fn split_telegram_text(text: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
@@ -6188,6 +6470,7 @@ fn split_telegram_text(text: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+/// Splits Telegram HTML by lines while keeping links balanced.
 fn split_html_lines_for_telegram(html: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     let mut parts = Vec::new();
@@ -6219,6 +6502,7 @@ fn split_html_lines_for_telegram(html: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+/// Splits Telegram HTML blocks, preserving `<pre>` blocks when possible.
 fn split_html_blocks_for_telegram(html: &str, limit: usize) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut pre_lines: Option<Vec<String>> = None;
@@ -6257,6 +6541,7 @@ fn split_html_blocks_for_telegram(html: &str, limit: usize) -> Vec<String> {
     blocks
 }
 
+/// Splits or escapes one long plain HTML line.
 fn split_plain_html_line_for_telegram(line: &str, limit: usize) -> String {
     if line.chars().count() > limit {
         html_escape_text(&truncate_for_telegram(&html_to_plain_text(line), limit))
@@ -6265,6 +6550,7 @@ fn split_plain_html_line_for_telegram(line: &str, limit: usize) -> String {
     }
 }
 
+/// Splits an oversized Telegram `<pre>` block into valid `<pre>` chunks.
 fn split_pre_block_for_telegram(block: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     if block.chars().count() <= limit {
@@ -6321,10 +6607,12 @@ fn split_pre_block_for_telegram(block: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+/// Wraps text in a Telegram `<pre>` block.
 fn wrap_pre_block(inner: &str) -> String {
     format!("{TELEGRAM_PRE_OPEN}{inner}{TELEGRAM_PRE_CLOSE}")
 }
 
+/// Splits a long paragraph by words for tests and splitter behavior.
 #[cfg(test)]
 fn split_long_paragraph(paragraph: &str, limit: usize) -> Vec<String> {
     let mut parts = Vec::new();
@@ -6356,6 +6644,7 @@ fn split_long_paragraph(paragraph: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+/// Splits an oversized word by character count.
 #[cfg(test)]
 fn split_long_word(word: &str, limit: usize) -> Vec<String> {
     let chars = word.chars().collect::<Vec<_>>();
@@ -6365,6 +6654,7 @@ fn split_long_word(word: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
+/// Truncates text to a Telegram-safe character count.
 fn truncate_for_telegram(value: &str, max_chars: usize) -> String {
     let count = value.chars().count();
     if count <= max_chars {
@@ -6378,6 +6668,7 @@ fn truncate_for_telegram(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Extracts a cleaned infobox text block from parsed article HTML.
 fn extract_infobox_text(language: &str, html: &str) -> Option<String> {
     let text = extract_infobox_text_from_dom(language, html).or_else(|| {
         let re = INFOBOX_TABLE_RE.get_or_init(|| {
@@ -6398,6 +6689,7 @@ fn extract_infobox_text(language: &str, html: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Extracts infobox text using the DOM parser before falling back to regex.
 fn extract_infobox_text_from_dom(language: &str, html: &str) -> Option<String> {
     let document = Html::parse_fragment(html);
     let infobox_selector = Selector::parse("table.infobox").expect("infobox selector is valid");
@@ -6413,6 +6705,7 @@ fn extract_infobox_text_from_dom(language: &str, html: &str) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+/// Renders one infobox table row, dropping empty labels and noise.
 fn render_infobox_row(language: &str, row: ElementRef<'_>) -> Option<String> {
     if element_has_class_part(row, &["metadata", "navbox", "noprint"]) {
         return None;
@@ -6476,6 +6769,7 @@ fn render_infobox_row(language: &str, row: ElementRef<'_>) -> Option<String> {
     }
 }
 
+/// Renders one infobox cell as compact Telegram HTML.
 fn infobox_cell_html(language: &str, cell: ElementRef<'_>) -> String {
     clean_infobox_text(&trim_html_spacing(&render_inline_element(language, cell)))
         .lines()
@@ -6485,10 +6779,12 @@ fn infobox_cell_html(language: &str, cell: ElementRef<'_>) -> String {
         .join(" / ")
 }
 
+/// Keeps unlabeled infobox rows only when they look meaningful.
 fn is_meaningful_unlabeled_infobox_line(line: &str) -> bool {
     parse_coordinate_pair(line).is_some() || line.chars().count() >= 24
 }
 
+/// Extracts the first useful infobox image.
 fn extract_infobox_image(html: &str) -> Option<MediaItem> {
     let document = Html::parse_fragment(html);
     let infobox_selector = Selector::parse("table.infobox").expect("infobox selector is valid");
@@ -6542,6 +6838,7 @@ fn extract_infobox_image(html: &str) -> Option<MediaItem> {
     None
 }
 
+/// Converts MediaWiki imageinfo into a media item.
 fn media_item_from_image_info_page(page: ImageInfoPage) -> Option<MediaItem> {
     let info = page.imageinfo?.into_iter().next()?;
     let fallback_url = info
@@ -6563,6 +6860,7 @@ fn media_item_from_image_info_page(page: ImageInfoPage) -> Option<MediaItem> {
     })
 }
 
+/// Normalizes protocol-relative and absolute image sources.
 fn normalize_image_src(src: &str) -> Option<String> {
     let src = html_escape::decode_html_entities(src.trim()).to_string();
     if src.is_empty() || src.starts_with("data:") {
@@ -6575,6 +6873,7 @@ fn normalize_image_src(src: &str) -> Option<String> {
     }
 }
 
+/// Reconstructs an original Commons URL from a thumbnail URL.
 fn wikimedia_original_image_url_from_thumbnail(url: &str) -> Option<String> {
     let (prefix, rest) = url.split_once("/thumb/")?;
     if !prefix.ends_with("upload.wikimedia.org/wikipedia/commons") {
@@ -6585,6 +6884,7 @@ fn wikimedia_original_image_url_from_thumbnail(url: &str) -> Option<String> {
     Some(format!("{prefix}/{original_path}"))
 }
 
+/// Rewrites a Commons thumbnail URL to request a larger width.
 fn wikimedia_thumbnail_url_with_width(url: &str, width: usize) -> Option<String> {
     let (prefix, rest) = url.split_once("/thumb/")?;
     if !prefix.ends_with("upload.wikimedia.org/wikipedia/commons") {
@@ -6597,6 +6897,7 @@ fn wikimedia_thumbnail_url_with_width(url: &str, width: usize) -> Option<String>
     Some(format!("{prefix}/thumb/{original_path}/{width}px-{suffix}"))
 }
 
+/// Checks whether a URL looks like an image file Telegram can send.
 fn looks_like_image_url(url: &str) -> bool {
     let without_query = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
     without_query.ends_with(".jpg")
@@ -6609,6 +6910,8 @@ fn looks_like_image_url(url: &str) -> bool {
         || without_query.ends_with(".svg")
 }
 
+/// Cleans CSS, map captions, sister-project boilerplate, and empty rows from an
+/// infobox text block.
 fn clean_infobox_text(text: &str) -> String {
     text.lines()
         .map(str::trim)
@@ -6624,12 +6927,14 @@ fn clean_infobox_text(text: &str) -> String {
         .join("\n")
 }
 
+/// Detects empty infobox labels that MediaWiki exposes as text.
 fn is_empty_infobox_label(line: &str) -> bool {
     line.trim()
         .strip_suffix(':')
         .is_some_and(|label| !label.trim().is_empty())
 }
 
+/// Detects map placeholder captions that do not make sense without the map.
 fn is_infobox_map_caption(line: &str) -> bool {
     let line = line.trim().to_ascii_lowercase();
     line.starts_with("interactive map")
@@ -6637,6 +6942,7 @@ fn is_infobox_map_caption(line: &str) -> bool {
         || line.starts_with("show all")
 }
 
+/// Detects sister-project infobox lines such as Commons links.
 fn is_infobox_sister_project_line(line: &str) -> bool {
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = line.to_lowercase();
@@ -6646,6 +6952,7 @@ fn is_infobox_sister_project_line(line: &str) -> bool {
         || lower == "media related to wikimedia commons"
 }
 
+/// Finds the closing table tag matching a table start in raw HTML.
 fn find_matching_table_end(html: &str, start: usize) -> Option<usize> {
     let lower = html.to_ascii_lowercase();
     let mut cursor = start;
@@ -6675,6 +6982,7 @@ fn find_matching_table_end(html: &str, start: usize) -> Option<usize> {
     }
 }
 
+/// Converts HTML to plain text for fallback parsing.
 fn html_to_text(html: &str) -> String {
     let without_style_script = STYLE_SCRIPT_RE
         .get_or_init(|| {
@@ -6702,6 +7010,7 @@ fn html_to_text(html: &str) -> String {
     normalize_text_lines(&decoded)
 }
 
+/// Normalizes plain text lines by trimming and dropping empties.
 fn normalize_text_lines(value: &str) -> String {
     let mut lines = Vec::new();
     for line in value.lines() {
@@ -6720,6 +7029,7 @@ fn normalize_text_lines(value: &str) -> String {
     lines.join("\n")
 }
 
+/// Checks whether a title is likely to represent a media file.
 fn looks_like_image_or_audio(title: &str) -> bool {
     let title = title.to_ascii_lowercase();
     title.ends_with(".jpg")
@@ -6737,6 +7047,7 @@ fn looks_like_image_or_audio(title: &str) -> bool {
         || title.ends_with(".flac")
 }
 
+/// Checks whether a media item is suitable for the article image gallery.
 fn is_gallery_image(item: &MediaItem) -> bool {
     let is_image = item
         .mime
@@ -6746,6 +7057,7 @@ fn is_gallery_image(item: &MediaItem) -> bool {
     is_image && !looks_like_icon_media_item(item)
 }
 
+/// Selects up to the configured gallery limit after dedupe and icon filtering.
 fn article_gallery_images(
     media: &ArticleMedia,
     infobox_image: Option<&MediaItem>,
@@ -6771,6 +7083,7 @@ fn article_gallery_images(
     images
 }
 
+/// Removes media items that were already sent inline with article sections.
 fn filter_excluded_media_items(
     images: Vec<MediaItem>,
     excluded_images: &[MediaItem],
@@ -6798,6 +7111,7 @@ fn filter_excluded_media_items(
         .collect()
 }
 
+/// Detects icon-like images by dimensions or title.
 fn looks_like_icon_media_item(item: &MediaItem) -> bool {
     looks_like_icon_title(&item.title)
         || looks_like_icon_title(&item.url)
@@ -6806,6 +7120,7 @@ fn looks_like_icon_media_item(item: &MediaItem) -> bool {
         })
 }
 
+/// Detects common icon/logo placeholder filenames.
 fn looks_like_icon_title(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase().replace([' ', '-'], "_");
     [
@@ -6830,6 +7145,7 @@ fn looks_like_icon_title(value: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
+/// Appends a media item unless an equivalent URL/title is already present.
 fn push_unique_media_item(items: &mut Vec<MediaItem>, item: MediaItem) {
     if !items
         .iter()
@@ -6839,11 +7155,13 @@ fn push_unique_media_item(items: &mut Vec<MediaItem>, item: MediaItem) {
     }
 }
 
+/// Compares media items for deduplication.
 fn media_items_match(left: &MediaItem, right: &MediaItem) -> bool {
     left.url == right.url
         || normalized_media_title(&left.title) == normalized_media_title(&right.title)
 }
 
+/// Normalizes file titles for media deduplication.
 fn normalized_media_title(title: &str) -> String {
     let title = title.trim();
     let title = title
