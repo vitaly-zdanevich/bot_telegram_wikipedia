@@ -8964,6 +8964,62 @@ mod tests {
     }
 
     #[test]
+    fn mediawiki_html_collects_blocks_inside_wrapper_elements() {
+        let html = r#"
+            <div class="mw-parser-output">
+              <div class="wrapper"><p>Lead <a href="/wiki/Target">target</a>.</p></div>
+              <div class="metadata"><p>Page chrome must be skipped.</p></div>
+              <div class="mw-heading mw-heading2">
+                <h2 id="Wrapped_heading">Wrapped heading</h2>
+                <span class="mw-editsection">edit</span>
+              </div>
+              <section>
+                <blockquote>Wrapped quote.</blockquote>
+                <ul><li>First item</li><li>Second item</li></ul>
+                <ol><li>Ordered item</li></ol>
+                <table class="wikitable">
+                  <tbody>
+                    <tr><th>Name</th><th>Value</th></tr>
+                    <tr><td>Alpha</td><td>Beta</td></tr>
+                  </tbody>
+                </table>
+              </section>
+            </div>
+        "#;
+
+        let sections = mediawiki_html_to_telegram_sections("en", "Wrapped Article", html);
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading, None);
+        assert!(
+            sections[0]
+                .html
+                .contains("Lead <a href=\"https://en.wikipedia.org/wiki/Target\">target</a>.")
+        );
+        assert!(!sections[0].html.contains("Page chrome"));
+        assert_eq!(
+            sections[1].heading,
+            Some(ArticleBodyHeading {
+                title: "Wrapped heading".to_string(),
+                anchor: Some("Wrapped_heading".to_string()),
+            })
+        );
+        assert!(
+            sections[1]
+                .html
+                .contains("<blockquote>Wrapped quote.</blockquote>")
+        );
+        assert!(sections[1].html.contains("- First item\n- Second item"));
+        assert!(sections[1].html.contains("1. Ordered item"));
+        assert!(
+            sections[1]
+                .html
+                .contains("<pre>Name  | Value\nAlpha | Beta</pre>")
+        );
+        assert!(!sections[1].html.contains("edit"));
+    }
+
+    #[test]
     fn mediawiki_html_skips_climate_data_tables_but_keeps_regular_tables() {
         let html = r#"
             <p>Lead body.</p>
@@ -9428,6 +9484,34 @@ mod tests {
     }
 
     #[test]
+    fn disambiguation_link_limit_allows_large_pages() {
+        let mut html = String::from("<h2><span id=\"Places\">Places</span></h2><ul>");
+        for index in 0..(DISAMBIGUATION_LINK_LIMIT + 5) {
+            html.push_str(&format!(
+                "<li><a href=\"/wiki/Rudnya_{index}\">Rudnya {index}</a></li>"
+            ));
+        }
+        html.push_str("</ul>");
+
+        let groups = mediawiki_disambiguation_link_groups("en", &html);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "Places");
+        assert_eq!(groups[0].links.len(), DISAMBIGUATION_LINK_LIMIT);
+        assert_eq!(groups[0].links[0].page_title, "Rudnya 0");
+        assert_eq!(
+            groups[0].links[DISAMBIGUATION_LINK_LIMIT - 1].page_title,
+            format!("Rudnya {}", DISAMBIGUATION_LINK_LIMIT - 1)
+        );
+        assert!(
+            !groups[0]
+                .links
+                .iter()
+                .any(|link| link.page_title == format!("Rudnya {DISAMBIGUATION_LINK_LIMIT}"))
+        );
+    }
+
+    #[test]
     fn parse_response_accepts_mixed_property_value_types() {
         let response: ParseResponse = serde_json::from_str(
             r#"{
@@ -9646,6 +9730,57 @@ mod tests {
                         page_title: "Batumi Tower".to_string(),
                     },
                 ],
+            }]
+        );
+    }
+
+    #[test]
+    fn mediawiki_nav_templates_skip_bad_links_and_dedupe_across_templates() {
+        let html = r#"
+            <table class="navbox">
+              <tbody>
+                <tr><th class="navbox-title">First nav</th></tr>
+                <tr>
+                  <td>
+                    <a href="/wiki/Alpha">Alpha</a>
+                    <a href="/wiki/Alpha">Alpha duplicate</a>
+                    <a class="selflink" href="/wiki/Self">Self</a>
+                    <a class="new" href="/wiki/Missing">Missing</a>
+                    <a href="/wiki/Help:Contents">Help</a>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <table class="navbox">
+              <tbody>
+                <tr><th class="navbox-title">Second nav</th></tr>
+                <tr>
+                  <td>
+                    <a href="/wiki/Alpha">Alpha repeated across templates</a>
+                    <a href="/wiki/Beta">Beta</a>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+        "#;
+
+        let templates = mediawiki_nav_templates("en", html);
+
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].title, "First nav");
+        assert_eq!(
+            templates[0].links,
+            vec![NavLink {
+                label: "Alpha".to_string(),
+                page_title: "Alpha".to_string(),
+            }]
+        );
+        assert_eq!(templates[1].title, "Second nav");
+        assert_eq!(
+            templates[1].links,
+            vec![NavLink {
+                label: "Beta".to_string(),
+                page_title: "Beta".to_string(),
             }]
         );
     }
