@@ -5038,42 +5038,7 @@ fn mediawiki_nav_templates(language: &str, html: &str) -> Vec<NavTemplate> {
     let mut templates = Vec::new();
 
     for template in document.select(&selector) {
-        let mut links = Vec::new();
-        for link in template.select(&link_selector) {
-            if element_has_class_part(link, &["selflink", "new"]) {
-                continue;
-            }
-
-            let Some(page_title) = link
-                .value()
-                .attr("href")
-                .and_then(wiki_article_title_from_href)
-            else {
-                continue;
-            };
-
-            let key = normalized_title_key(&page_title);
-            if !seen.insert(key) {
-                continue;
-            }
-
-            let label = trim_html_spacing(&render_inline_element(language, link));
-            let label = html_to_plain_text(&label);
-            let label = label.trim();
-            if label.is_empty() {
-                continue;
-            }
-
-            links.push(NavLink {
-                label: label.to_string(),
-                page_title,
-            });
-
-            if links.len() >= NAV_TEMPLATE_LINK_LIMIT {
-                break;
-            }
-        }
-
+        let links = nav_template_links(language, template, &link_selector, &mut seen);
         if !links.is_empty() {
             let title = nav_template_title(language, template);
             templates.push(NavTemplate {
@@ -5088,6 +5053,54 @@ fn mediawiki_nav_templates(language: &str, html: &str) -> Vec<NavTemplate> {
     }
 
     templates
+}
+
+/// Extracts article links from one navigation template.
+fn nav_template_links(
+    language: &str,
+    template: ElementRef<'_>,
+    link_selector: &Selector,
+    seen: &mut HashSet<String>,
+) -> Vec<NavLink> {
+    let mut links = Vec::new();
+    for link in template.select(link_selector) {
+        let Some(nav_link) = nav_template_link(language, link, seen) else {
+            continue;
+        };
+
+        links.push(nav_link);
+        if links.len() >= NAV_TEMPLATE_LINK_LIMIT {
+            break;
+        }
+    }
+    links
+}
+
+/// Converts one navigation-template anchor into a button target.
+fn nav_template_link(
+    language: &str,
+    link: ElementRef<'_>,
+    seen: &mut HashSet<String>,
+) -> Option<NavLink> {
+    if element_has_class_part(link, &["selflink", "new"]) {
+        return None;
+    }
+
+    let page_title = link
+        .value()
+        .attr("href")
+        .and_then(wiki_article_title_from_href)?;
+    if !seen.insert(normalized_title_key(&page_title)) {
+        return None;
+    }
+
+    let label = trim_html_spacing(&render_inline_element(language, link));
+    let label = html_to_plain_text(&label);
+    let label = label.trim();
+    (!label.is_empty()).then(|| NavLink {
+        label: label.to_string(),
+        page_title,
+    })
 }
 
 /// Extracts the displayed title for a navigation template.
@@ -5253,70 +5266,136 @@ fn collect_html_blocks(
     element: ElementRef<'_>,
     sections: &mut ArticleBodySectionBuilder,
 ) {
-    if element.value().name() == "img" {
-        if let Some(image) = media_item_from_html_image(language, element) {
-            sections.push_image(image);
-        }
+    if collect_html_media_block(language, element, sections) || should_skip_block(element) {
         return;
     }
 
-    if element.value().name() == "figure" {
-        collect_html_images(language, element, sections);
+    if collect_named_html_block(language, element, sections) {
         return;
     }
 
-    if should_skip_block(element) {
-        return;
-    }
+    collect_child_html_blocks(language, element, sections);
+}
 
-    let name = element.value().name();
-    match name {
-        "p" => {
-            let rendered = trim_html_spacing(&render_inline_element(language, element));
-            if !rendered.is_empty() {
-                sections.push_block(rendered);
+/// Handles image-like block elements and reports whether the element was
+/// consumed.
+fn collect_html_media_block(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) -> bool {
+    match element.value().name() {
+        "img" => {
+            if let Some(image) = media_item_from_html_image(language, element) {
+                sections.push_image(image);
             }
+            true
         }
-        "blockquote" => {
-            let rendered = trim_html_spacing(&render_inline_element(language, element));
-            if !rendered.is_empty() {
-                sections.push_block(format!("<blockquote>{rendered}</blockquote>"));
-            }
+        "figure" => {
+            collect_html_images(language, element, sections);
+            true
         }
+        _ => false,
+    }
+}
+
+/// Handles block elements that the bot renders directly.
+fn collect_named_html_block(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) -> bool {
+    match element.value().name() {
+        "p" => push_inline_html_block(language, element, sections),
+        "blockquote" => push_blockquote_html_block(language, element, sections),
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-            let rendered = trim_html_spacing(&render_inline_element(language, element));
-            let heading_text = html_to_plain_text(&rendered);
-            if !rendered.is_empty() && !is_terminal_article_heading(&heading_text) {
-                sections.start_section(ArticleBodyHeading {
-                    title: heading_text,
-                    anchor: element_anchor_id(element),
-                });
-            }
+            start_html_heading_section(language, element, sections)
         }
-        "ul" => {
-            let rendered = render_list(language, element, false);
-            if !rendered.is_empty() {
-                sections.push_block(rendered);
-            }
-        }
-        "ol" => {
-            let rendered = render_list(language, element, true);
-            if !rendered.is_empty() {
-                sections.push_block(rendered);
-            }
-        }
-        "table" => {
-            let rendered = render_table(language, element);
-            if !rendered.is_empty() {
-                sections.push_block(rendered);
-            }
-        }
-        _ => {
-            for child in element.children() {
-                if let Some(child_element) = ElementRef::wrap(child) {
-                    collect_html_blocks(language, child_element, sections);
-                }
-            }
+        "ul" => push_list_html_block(language, element, sections, false),
+        "ol" => push_list_html_block(language, element, sections, true),
+        "table" => push_table_html_block(language, element, sections),
+        _ => false,
+    }
+}
+
+/// Renders a paragraph-like block and appends it when non-empty.
+fn push_inline_html_block(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) -> bool {
+    let rendered = trim_html_spacing(&render_inline_element(language, element));
+    push_nonempty_html_block(sections, rendered);
+    true
+}
+
+/// Renders a blockquote with Telegram-supported markup.
+fn push_blockquote_html_block(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) -> bool {
+    let rendered = trim_html_spacing(&render_inline_element(language, element));
+    if !rendered.is_empty() {
+        sections.push_block(format!("<blockquote>{rendered}</blockquote>"));
+    }
+    true
+}
+
+/// Starts a new section from a MediaWiki heading.
+fn start_html_heading_section(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) -> bool {
+    let rendered = trim_html_spacing(&render_inline_element(language, element));
+    let heading_text = html_to_plain_text(&rendered);
+    if !rendered.is_empty() && !is_terminal_article_heading(&heading_text) {
+        sections.start_section(ArticleBodyHeading {
+            title: heading_text,
+            anchor: element_anchor_id(element),
+        });
+    }
+    true
+}
+
+/// Renders an ordered or unordered list block.
+fn push_list_html_block(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+    ordered: bool,
+) -> bool {
+    push_nonempty_html_block(sections, render_list(language, element, ordered));
+    true
+}
+
+/// Renders a table block.
+fn push_table_html_block(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) -> bool {
+    push_nonempty_html_block(sections, render_table(language, element));
+    true
+}
+
+/// Appends a rendered block only when it has user-visible content.
+fn push_nonempty_html_block(sections: &mut ArticleBodySectionBuilder, rendered: String) {
+    if !rendered.is_empty() {
+        sections.push_block(rendered);
+    }
+}
+
+/// Recurses into children of wrapper elements that are not rendered directly.
+fn collect_child_html_blocks(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) {
+    for child in element.children() {
+        if let Some(child_element) = ElementRef::wrap(child) {
+            collect_html_blocks(language, child_element, sections);
         }
     }
 }
@@ -6687,36 +6766,57 @@ fn split_telegram_text(text: &str, limit: usize) -> Vec<String> {
             continue;
         }
 
-        let separator = if current.is_empty() { "" } else { "\n\n" };
-        if current.chars().count() + separator.chars().count() + paragraph.chars().count() <= limit
-        {
-            current.push_str(separator);
-            current.push_str(paragraph);
+        if append_plain_paragraph_if_it_fits(&mut current, paragraph, limit) {
             continue;
         }
 
-        if !current.is_empty() {
-            parts.push(current);
-            current = String::new();
-        }
-
-        let mut paragraph_chunks = split_long_paragraph(paragraph, limit)
-            .into_iter()
-            .peekable();
-        while let Some(chunk) = paragraph_chunks.next() {
-            if paragraph_chunks.peek().is_some() || chunk.chars().count() == limit {
-                parts.push(chunk);
-            } else {
-                current = chunk;
-            }
-        }
+        flush_plain_text_part(&mut parts, &mut current);
+        append_split_plain_paragraph(&mut parts, &mut current, paragraph, limit);
     }
 
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
+    flush_plain_text_part(&mut parts, &mut current);
     parts
+}
+
+/// Appends one paragraph to the current plain-text chunk when it fits.
+#[cfg(test)]
+fn append_plain_paragraph_if_it_fits(current: &mut String, paragraph: &str, limit: usize) -> bool {
+    let separator = if current.is_empty() { "" } else { "\n\n" };
+    if current.chars().count() + separator.chars().count() + paragraph.chars().count() > limit {
+        return false;
+    }
+
+    current.push_str(separator);
+    current.push_str(paragraph);
+    true
+}
+
+/// Flushes a pending plain-text chunk.
+#[cfg(test)]
+fn flush_plain_text_part(parts: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        parts.push(std::mem::take(current));
+    }
+}
+
+/// Splits an oversized paragraph and keeps the final non-full chunk pending.
+#[cfg(test)]
+fn append_split_plain_paragraph(
+    parts: &mut Vec<String>,
+    current: &mut String,
+    paragraph: &str,
+    limit: usize,
+) {
+    let mut paragraph_chunks = split_long_paragraph(paragraph, limit)
+        .into_iter()
+        .peekable();
+    while let Some(chunk) = paragraph_chunks.next() {
+        if paragraph_chunks.peek().is_some() || chunk.chars().count() == limit {
+            parts.push(chunk);
+        } else {
+            *current = chunk;
+        }
+    }
 }
 
 /// Splits Telegram HTML by lines while keeping links balanced.
