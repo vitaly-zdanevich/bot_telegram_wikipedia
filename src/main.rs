@@ -39,6 +39,9 @@ const ARTICLE_IMAGE_GALLERY_LIMIT: usize = 10;
 const MIN_ICON_FILTER_SIDE_PX: u64 = 160;
 const INLINE_MESSAGE_CHAR_LIMIT: usize = 3900;
 const INLINE_CACHE_TIME_SECONDS: u32 = 0;
+const TABLE_CELL_MAX_CHARS: usize = 48;
+const TELEGRAM_PRE_OPEN: &str = "<pre>";
+const TELEGRAM_PRE_CLOSE: &str = "</pre>";
 const WIKIDATA_ENTITY_BATCH_SIZE: usize = 50;
 const WIKIDATA_PROPERTY_DISPLAY_LIMIT: usize = 80;
 const WIKIDATA_VALUES_PER_PROPERTY_LIMIT: usize = 8;
@@ -3886,18 +3889,17 @@ fn render_article_body_section_prefix(
 ) -> String {
     let article_url = article_url(language, article_title);
     let article = html_link(&article_url, article_title);
-    let (section_title, section_url) = match section.heading.as_ref() {
-        Some(heading) => (
-            heading.title.as_str(),
-            article_body_section_url(language, article_title, heading.anchor.as_deref()),
+    match section.heading.as_ref() {
+        Some(heading) => format!(
+            "{}: {}",
+            article,
+            html_italic_link(
+                &article_body_section_url(language, article_title, heading.anchor.as_deref()),
+                &heading.title
+            )
         ),
-        None => ("Lead", article_url),
-    };
-    format!(
-        "{}: {}",
-        article,
-        html_italic_link(&section_url, section_title)
-    )
+        None => article,
+    }
 }
 
 fn article_body_section_url(language: &str, article_title: &str, anchor: Option<&str>) -> String {
@@ -4697,9 +4699,18 @@ fn render_list(language: &str, element: ElementRef<'_>, ordered: bool) -> String
 fn render_table(language: &str, table: ElementRef<'_>) -> String {
     let mut rows = Vec::new();
     collect_table_rows(table, &mut rows);
+    let mut links = Vec::new();
 
-    rows.into_iter()
-        .filter_map(|row| render_table_row(language, row))
+    let rows = rows
+        .into_iter()
+        .filter_map(|row| render_table_row(language, row, &mut links))
+        .collect::<Vec<_>>();
+
+    let table = format_plain_text_table(&rows);
+    let links = format_table_links(&links);
+    [table, links]
+        .into_iter()
+        .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -4717,24 +4728,134 @@ fn collect_table_rows<'a>(element: ElementRef<'a>, rows: &mut Vec<ElementRef<'a>
     }
 }
 
-fn render_table_row(language: &str, row: ElementRef<'_>) -> Option<String> {
+fn render_table_row(
+    language: &str,
+    row: ElementRef<'_>,
+    links: &mut Vec<TableLink>,
+) -> Option<Vec<String>> {
     let cells = row
         .children()
         .filter_map(ElementRef::wrap)
         .filter(|cell| matches!(cell.value().name(), "th" | "td"))
-        .filter_map(|cell| {
+        .flat_map(|cell| {
+            collect_table_links(language, cell, links);
+            let colspan = cell_colspan(cell);
             let rendered = trim_html_spacing(&render_inline_element(language, cell));
-            let rendered = rendered
+            let plain = html_to_plain_text(&rendered)
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>()
                 .join(" / ");
-            (!rendered.is_empty()).then_some(rendered)
+            if plain.is_empty() {
+                return Vec::new();
+            }
+
+            let mut expanded = Vec::with_capacity(colspan);
+            expanded.push(truncate_for_telegram(&plain, TABLE_CELL_MAX_CHARS));
+            expanded.extend((1..colspan).map(|_| String::new()));
+            expanded
         })
         .collect::<Vec<_>>();
 
-    (!cells.is_empty()).then(|| cells.join(" | "))
+    (!cells.is_empty()).then_some(cells)
+}
+
+fn cell_colspan(cell: ElementRef<'_>) -> usize {
+    cell.value()
+        .attr("colspan")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(12))
+        .unwrap_or(1)
+}
+
+fn format_plain_text_table(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if column_count == 0 {
+        return String::new();
+    }
+
+    let mut widths = vec![0usize; column_count];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(index, cell)| pad_right_chars(cell, widths[index]))
+                .collect::<Vec<_>>()
+                .join(" | ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{TELEGRAM_PRE_OPEN}{}{TELEGRAM_PRE_CLOSE}",
+        html_escape_text(&table)
+    )
+}
+
+fn pad_right_chars(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count >= width {
+        return value.to_string();
+    }
+
+    let mut padded = String::with_capacity(value.len() + width.saturating_sub(count));
+    padded.push_str(value);
+    padded.extend(std::iter::repeat_n(' ', width - count));
+    padded
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableLink {
+    text: String,
+    url: String,
+}
+
+fn collect_table_links(language: &str, element: ElementRef<'_>, links: &mut Vec<TableLink>) {
+    if element.value().name() == "a"
+        && let Some(url) = element
+            .value()
+            .attr("href")
+            .and_then(|href| normalize_wiki_href(language, href))
+    {
+        let text = html_to_plain_text(&render_inline_element(language, element));
+        let text = if text.is_empty() { url.clone() } else { text };
+        if !links.iter().any(|link| link.url == url) {
+            links.push(TableLink { text, url });
+        }
+    }
+
+    for child in element.children() {
+        if let Some(child_element) = ElementRef::wrap(child) {
+            collect_table_links(language, child_element, links);
+        }
+    }
+}
+
+fn format_table_links(links: &[TableLink]) -> String {
+    if links.is_empty() {
+        return String::new();
+    }
+
+    let links = links
+        .iter()
+        .map(|link| html_link(&link.url, &link.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}\n{}", html_bold("Table links"), links)
 }
 
 fn render_inline_element(language: &str, element: ElementRef<'_>) -> String {
@@ -4807,23 +4928,43 @@ fn should_skip_block(element: ElementRef<'_>) -> bool {
     matches!(
         name,
         "style" | "script" | "noscript" | "figure" | "img" | "audio" | "video"
-    ) || element_has_class_part(
-        element,
-        &[
-            "infobox",
-            "navbox",
-            "metadata",
-            "reflist",
-            "reference",
-            "ambox",
-            "hatnote",
-            "noprint",
-            "gallery",
-            "portal",
-            "mw-editsection",
-            "mw-empty-elt",
-        ],
-    )
+    ) || (name == "table" && is_climate_data_table(element))
+        || element_has_class_part(
+            element,
+            &[
+                "infobox",
+                "navbox",
+                "metadata",
+                "reflist",
+                "reference",
+                "ambox",
+                "hatnote",
+                "noprint",
+                "gallery",
+                "portal",
+                "mw-editsection",
+                "mw-empty-elt",
+            ],
+        )
+}
+
+fn is_climate_data_table(table: ElementRef<'_>) -> bool {
+    if element_has_class_part(table, &["weatherbox", "climate"]) {
+        return true;
+    }
+
+    let text = table
+        .text()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = text.to_lowercase();
+
+    (lower.starts_with("climate data for ") || lower.contains(" climate data for "))
+        && lower.contains("month")
+        && (lower.contains("record high") || lower.contains("daily mean"))
 }
 
 fn should_skip_inline(element: ElementRef<'_>) -> bool {
@@ -5692,24 +5833,18 @@ fn split_html_lines_for_telegram(html: &str, limit: usize) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
 
-    for line in html.lines() {
-        let line = if line.chars().count() > limit {
-            html_escape_text(&truncate_for_telegram(&html_to_plain_text(line), limit))
-        } else {
-            line.to_string()
-        };
-
+    for block in split_html_blocks_for_telegram(html, limit) {
         if current.is_empty() {
-            current = line;
+            current = block;
             continue;
         }
 
-        if current.chars().count() + 1 + line.chars().count() <= limit {
+        if current.chars().count() + 1 + block.chars().count() <= limit {
             current.push('\n');
-            current.push_str(&line);
+            current.push_str(&block);
         } else {
             parts.push(current);
-            current = line;
+            current = block;
         }
     }
 
@@ -5722,6 +5857,112 @@ fn split_html_lines_for_telegram(html: &str, limit: usize) -> Vec<String> {
     }
 
     parts
+}
+
+fn split_html_blocks_for_telegram(html: &str, limit: usize) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut pre_lines: Option<Vec<String>> = None;
+
+    for line in html.lines() {
+        if let Some(lines) = pre_lines.as_mut() {
+            lines.push(line.to_string());
+            if line.contains(TELEGRAM_PRE_CLOSE)
+                && let Some(lines) = pre_lines.take()
+            {
+                blocks.extend(split_pre_block_for_telegram(&lines.join("\n"), limit));
+            }
+            continue;
+        }
+
+        if line.starts_with(TELEGRAM_PRE_OPEN) {
+            if line.contains(TELEGRAM_PRE_CLOSE) {
+                blocks.extend(split_pre_block_for_telegram(line, limit));
+            } else {
+                pre_lines = Some(vec![line.to_string()]);
+            }
+            continue;
+        }
+
+        blocks.push(split_plain_html_line_for_telegram(line, limit));
+    }
+
+    if let Some(lines) = pre_lines {
+        blocks.extend(
+            lines
+                .into_iter()
+                .map(|line| split_plain_html_line_for_telegram(&line, limit)),
+        );
+    }
+
+    blocks
+}
+
+fn split_plain_html_line_for_telegram(line: &str, limit: usize) -> String {
+    if line.chars().count() > limit {
+        html_escape_text(&truncate_for_telegram(&html_to_plain_text(line), limit))
+    } else {
+        line.to_string()
+    }
+}
+
+fn split_pre_block_for_telegram(block: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    if block.chars().count() <= limit {
+        return vec![block.to_string()];
+    }
+
+    let Some(inner) = block
+        .strip_prefix(TELEGRAM_PRE_OPEN)
+        .and_then(|value| value.strip_suffix(TELEGRAM_PRE_CLOSE))
+    else {
+        return block
+            .lines()
+            .map(|line| split_plain_html_line_for_telegram(line, limit))
+            .collect();
+    };
+
+    let overhead = TELEGRAM_PRE_OPEN.chars().count() + TELEGRAM_PRE_CLOSE.chars().count();
+    let inner_limit = limit.saturating_sub(overhead).max(1);
+    let mut parts = Vec::new();
+    let mut current = String::new();
+
+    for line in inner.lines() {
+        let line = if line.chars().count() > inner_limit {
+            html_escape_text(&truncate_for_telegram(
+                &html_to_plain_text(line),
+                inner_limit,
+            ))
+        } else {
+            line.to_string()
+        };
+
+        if current.is_empty() {
+            current = line;
+            continue;
+        }
+
+        if overhead + current.chars().count() + 1 + line.chars().count() <= limit {
+            current.push('\n');
+            current.push_str(&line);
+        } else {
+            parts.push(wrap_pre_block(&current));
+            current = line;
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(wrap_pre_block(&current));
+    }
+
+    if parts.is_empty() {
+        parts.push(wrap_pre_block(""));
+    }
+
+    parts
+}
+
+fn wrap_pre_block(inner: &str) -> String {
+    format!("{TELEGRAM_PRE_OPEN}{inner}{TELEGRAM_PRE_CLOSE}")
 }
 
 #[cfg(test)]
@@ -7397,8 +7638,9 @@ mod tests {
 
         assert!(parts.len() >= 3);
         assert!(parts.iter().any(|part| part.starts_with(
-            "<a href=\"https://en.wikipedia.org/wiki/Example_Article\">Example Article</a>: <i><a href=\"https://en.wikipedia.org/wiki/Example_Article\">Lead</a></i>"
+            "<a href=\"https://en.wikipedia.org/wiki/Example_Article\">Example Article</a>\n\nLead body."
         )));
+        assert!(!parts.iter().any(|part| part.contains(">Lead</a>")));
         assert!(parts.iter().any(|part| part.starts_with(
             "<a href=\"https://en.wikipedia.org/wiki/Example_Article\">Example Article</a>: <i><a href=\"https://en.wikipedia.org/wiki/Example_Article#History\">History</a></i>"
         )));
@@ -7434,6 +7676,90 @@ mod tests {
     }
 
     #[test]
+    fn mediawiki_html_skips_climate_data_tables_but_keeps_regular_tables() {
+        let html = r#"
+            <p>Lead body.</p>
+            <table class="wikitable">
+              <tbody>
+                <tr><th>Name</th><th>Use</th></tr>
+                <tr><td><a href="/wiki/Batumi_Tower">Batumi Tower</a></td><td>Skyscraper</td></tr>
+              </tbody>
+            </table>
+            <table class="wikitable mw-collapsible">
+              <tbody>
+                <tr><th colspan="14">Climate data for Batumi Airport (normals for 1981-2010)</th></tr>
+                <tr><th>Month</th><th>Jan</th><th>Feb</th><th>Year</th></tr>
+                <tr><th>Record high °C (°F)</th><td>25.3</td><td>27.4</td><td>40.8</td></tr>
+                <tr><th>Daily mean °C (°F)</th><td>5.4</td><td>6.8</td><td>14.2</td></tr>
+              </tbody>
+            </table>
+        "#;
+
+        let rendered = mediawiki_html_to_telegram_html("en", "Batumi", html).unwrap();
+
+        assert!(rendered.contains("<pre>Name         | Use\nBatumi Tower | Skyscraper</pre>"));
+        assert!(rendered.contains("<b>Table links</b>"));
+        assert!(
+            rendered.contains(
+                "<a href=\"https://en.wikipedia.org/wiki/Batumi_Tower\">Batumi Tower</a>"
+            )
+        );
+        assert!(!rendered.contains("Climate data for Batumi Airport"));
+        assert!(!rendered.contains("Record high"));
+        assert!(!rendered.contains("Daily mean"));
+    }
+
+    #[test]
+    fn mediawiki_html_formats_tables_as_aligned_monospace_rows() {
+        let html = r#"
+            <table class="wikitable">
+              <tbody>
+                <tr><th>Year</th><th colspan="2">Georgians</th><th colspan="2">Armenians</th><th>Total</th></tr>
+                <tr><td>1886</td><td>2,518</td><td>17%</td><td>3,458</td><td>23.4%</td><td>14,803</td></tr>
+                <tr><td>2014</td><td>142,691</td><td>93.4%</td><td>4,636</td><td>3.0%</td><td>152,839</td></tr>
+              </tbody>
+            </table>
+        "#;
+
+        let rendered = mediawiki_html_to_telegram_html("en", "Batumi", html).unwrap();
+
+        assert!(rendered.contains(
+            "<pre>Year | Georgians |       | Armenians |       | Total\n1886 | 2,518     | 17%   | 3,458     | 23.4% | 14,803\n2014 | 142,691   | 93.4% | 4,636     | 3.0%  | 152,839</pre>"
+        ));
+    }
+
+    #[test]
+    fn mediawiki_html_lists_all_distinct_links_after_tables() {
+        let html = r#"
+            <table class="wikitable">
+              <tbody>
+                <tr><th>Name</th><th>Location</th></tr>
+                <tr>
+                  <td><a href="/wiki/Batumi_Tower">Batumi Tower</a></td>
+                  <td><a href="/wiki/Batumi">Batumi</a></td>
+                </tr>
+                <tr>
+                  <td><a href="/wiki/Batumi_Tower">Batumi Tower duplicate</a></td>
+                  <td><a href="/wiki/Adjara">Adjara</a></td>
+                </tr>
+              </tbody>
+            </table>
+        "#;
+
+        let rendered = mediawiki_html_to_telegram_html("en", "Batumi", html).unwrap();
+
+        assert!(rendered.contains("<b>Table links</b>"));
+        assert_eq!(
+            rendered
+                .matches("https://en.wikipedia.org/wiki/Batumi_Tower")
+                .count(),
+            1
+        );
+        assert!(rendered.contains("<a href=\"https://en.wikipedia.org/wiki/Batumi\">Batumi</a>"));
+        assert!(rendered.contains("<a href=\"https://en.wikipedia.org/wiki/Adjara\">Adjara</a>"));
+    }
+
+    #[test]
     fn mediawiki_html_preserves_inline_body_links_and_skips_refs() {
         let html = r#"
             <p><b>Rust</b> is a <a href="/wiki/Programming_language">programming language</a>.<sup class="reference">[1]</sup></p>
@@ -7462,10 +7788,15 @@ mod tests {
         assert!(rendered.contains(
             "<b><a href=\"https://en.wikipedia.org/wiki/Rust_%26_Test#History\">History</a></b>"
         ));
-        assert!(rendered.contains("Name | Use"));
-        assert!(rendered.contains(
-            "<a href=\"https://en.wikipedia.org/wiki/Batumi_Tower\">Batumi Tower</a> | Skyscraper / hotel"
-        ));
+        assert!(
+            rendered.contains("<pre>Name         | Use\nBatumi Tower | Skyscraper / hotel</pre>")
+        );
+        assert!(rendered.contains("<b>Table links</b>"));
+        assert!(
+            rendered.contains(
+                "<a href=\"https://en.wikipedia.org/wiki/Batumi_Tower\">Batumi Tower</a>"
+            )
+        );
         assert!(!rendered.contains("[1]"));
         assert!(!rendered.contains("Reference text"));
     }
@@ -7843,6 +8174,47 @@ mod tests {
         assert!(parts.len() > 1);
         for part in parts {
             assert_eq!(part.matches("<a ").count(), part.matches("</a>").count());
+        }
+    }
+
+    #[test]
+    fn html_line_splitter_keeps_pre_block_together_when_it_fits() {
+        let html = "Intro\n<pre>Year | Total\n1886 | 14,803</pre>\nAfter";
+
+        let parts = split_html_lines_for_telegram(html, 44);
+
+        assert!(
+            parts
+                .iter()
+                .any(|part| part.contains("<pre>Year | Total\n1886 | 14,803</pre>"))
+        );
+        for part in parts {
+            assert_eq!(
+                part.matches(TELEGRAM_PRE_OPEN).count(),
+                part.matches(TELEGRAM_PRE_CLOSE).count()
+            );
+        }
+    }
+
+    #[test]
+    fn html_line_splitter_splits_large_pre_blocks_into_valid_chunks() {
+        let html = "<pre>row one\nrow two\nrow three</pre>";
+
+        let parts = split_html_lines_for_telegram(html, 23);
+
+        assert_eq!(
+            parts,
+            vec![
+                "<pre>row one</pre>".to_string(),
+                "<pre>row two</pre>".to_string(),
+                "<pre>row three</pre>".to_string(),
+            ]
+        );
+        for part in parts {
+            assert_eq!(
+                part.matches(TELEGRAM_PRE_OPEN).count(),
+                part.matches(TELEGRAM_PRE_CLOSE).count()
+            );
         }
     }
 
