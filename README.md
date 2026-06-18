@@ -1,5 +1,24 @@
 # Telegram Wikipedia Bot
 
+[![CI](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia/actions/workflows/ci.yml)
+[![Build](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia/actions/workflows/build.yml)
+[![SonarQube Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=coverage)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=bugs)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Duplicated Lines](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=duplicated_lines_density)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Maintainability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Reliability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Security](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikipedia&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikipedia)
+[![GitHub release](https://img.shields.io/github/v/release/vitaly-zdanevich/bot_telegram_wikipedia?include_prereleases&sort=semver)](https://github.com/vitaly-zdanevich/bot_telegram_wikipedia/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Telegram bot](https://img.shields.io/badge/Telegram-@wikipedia__unofficial__bot-26A5E4?logo=telegram&logoColor=white)](https://t.me/wikipedia_unofficial_bot)
+[![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
+[![AWS Lambda](https://img.shields.io/badge/AWS-Lambda-FF9900?logo=awslambda&logoColor=white)](https://aws.amazon.com/lambda/)
+[![Terraform](https://img.shields.io/badge/Terraform-1.6+-844FBA?logo=terraform&logoColor=white)](https://www.terraform.io/)
+
 Public Telegram bot for searching Wikipedia, using Telegram inline mode,
 opening articles from inline buttons, splitting large articles across Telegram
 messages, and returning metadata/media after the article body.
