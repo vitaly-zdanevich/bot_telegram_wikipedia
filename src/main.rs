@@ -32,6 +32,7 @@ const CATEGORY_BUTTON_LIMIT: usize = 12;
 const CATEGORY_SEARCH_FETCH_LIMIT: usize = 500;
 const NAV_TEMPLATE_LINK_LIMIT: usize = 30;
 const DISAMBIGUATION_LINK_LIMIT: usize = 30;
+const DISAMBIGUATION_BUTTON_PREFIX: &str = "🔀 ";
 const ARTICLE_BODY_LINK_LIMIT: usize = 20;
 const ARTICLE_TITLE_LOOKUP_LIMIT: usize = 50;
 const MEDIA_FILE_LOOKUP_LIMIT: usize = 50;
@@ -805,7 +806,7 @@ impl App {
         let mut categories_task: Option<JoinHandle<Result<Vec<Category>>>> = None;
         let mut body_links_task: Option<JoinHandle<Result<Vec<ArticleButton>>>> = None;
         let mut navigation_task: Option<JoinHandle<Result<Vec<NavTemplateButtons>>>> = None;
-        let mut disambiguation_task: Option<JoinHandle<Result<Vec<ArticleButton>>>> = None;
+        let mut disambiguation_task: Option<JoinHandle<Result<Vec<ArticleButtonGroup>>>> = None;
         let mut metadata_task: Option<JoinHandle<Result<ArticleMetadata>>> = None;
         let mut media_task: Option<JoinHandle<Result<ArticleMedia>>> = None;
 
@@ -856,12 +857,15 @@ impl App {
                     }));
                 }
 
-                if !article.disambiguation_links.is_empty() {
+                if !article.disambiguation_groups.is_empty() {
                     disambiguation_task = Some(spawn_wiki_task({
                         let wiki = self.wiki.clone();
                         let language = language.clone();
-                        let links = article.disambiguation_links.clone();
-                        async move { wiki.article_buttons_for_links(&language, &links).await }
+                        let groups = article.disambiguation_groups.clone();
+                        async move {
+                            wiki.article_button_groups_for_link_groups(&language, &groups)
+                                .await
+                        }
                     }));
                 }
 
@@ -910,9 +914,16 @@ impl App {
 
         if let Some(disambiguation_task) = disambiguation_task {
             match join_task(disambiguation_task).await {
-                Ok(links) => {
-                    self.send_article_buttons_message(chat_id, &language, "Disambiguation", &links)
+                Ok(groups) => {
+                    for group in groups {
+                        self.send_article_buttons_message(
+                            chat_id,
+                            &language,
+                            &format!("Disambiguation: {}", group.title),
+                            &group.buttons,
+                        )
                         .await?;
+                    }
                 }
                 Err(err) => {
                     warn!(error = %format_error_chain(&err), "failed to fetch disambiguation links")
@@ -1437,14 +1448,15 @@ impl WikiClient {
             ("action", "query".to_string()),
             ("format", "json".to_string()),
             ("formatversion", "2".to_string()),
-            ("list", "search".to_string()),
-            ("srsearch", query.to_string()),
-            ("srlimit", limit.min(MAX_SEARCH_LIMIT).to_string()),
-            ("srprop", "snippet|wordcount|size|timestamp".to_string()),
+            ("generator", "search".to_string()),
+            ("gsrsearch", query.to_string()),
+            ("gsrnamespace", "0".to_string()),
+            ("gsrlimit", limit.min(MAX_SEARCH_LIMIT).to_string()),
+            ("prop", "info|pageprops".to_string()),
             ("utf8", "1".to_string()),
         ];
 
-        let response: SearchResponse = self
+        let response: CategoryInfoResponse = self
             .http
             .get(wiki_api_url(language)?)
             .query(&params)
@@ -1454,20 +1466,20 @@ impl WikiClient {
             .json()
             .await?;
 
-        let results = response
-            .query
-            .search
+        let mut pages = response.query.map(|query| query.pages).unwrap_or_default();
+        pages.sort_by_key(|page| page.index.unwrap_or(usize::MAX));
+
+        let results = pages
             .into_iter()
-            .map(|hit| ArticleButton {
-                page_id: hit.pageid,
-                title: html_to_text(&hit.title),
-                size: hit.size,
-                wordcount: hit.wordcount,
-                snippet: hit
-                    .snippet
-                    .as_deref()
-                    .map(html_to_text)
-                    .filter(|snippet| !snippet.is_empty()),
+            .filter_map(|page| {
+                Some(ArticleButton {
+                    page_id: page.pageid?,
+                    title: page.title.clone(),
+                    size: page.length,
+                    wordcount: None,
+                    snippet: None,
+                    is_disambiguation: info_page_is_disambiguation(&page),
+                })
             })
             .collect::<Vec<_>>();
         self.cache_put(cache_key, &results, |cache| &mut cache.search);
@@ -1493,7 +1505,7 @@ impl WikiClient {
             ("gsrsearch", query.to_string()),
             ("gsrnamespace", "0".to_string()),
             ("gsrlimit", limit.min(MAX_SEARCH_LIMIT).to_string()),
-            ("prop", "extracts|info".to_string()),
+            ("prop", "extracts|info|pageprops".to_string()),
             ("exintro", "1".to_string()),
             ("explaintext", "1".to_string()),
             ("inprop", "url".to_string()),
@@ -1515,6 +1527,7 @@ impl WikiClient {
         let results = pages
             .into_iter()
             .filter_map(|page| {
+                let is_disambiguation = info_page_is_disambiguation(&page);
                 Some(ArticleButton {
                     page_id: page.pageid?,
                     title: page.title,
@@ -1524,6 +1537,7 @@ impl WikiClient {
                         .extract
                         .map(|extract| normalize_inline_extract(&extract))
                         .filter(|snippet| !snippet.is_empty()),
+                    is_disambiguation,
                 })
             })
             .collect::<Vec<_>>();
@@ -1640,6 +1654,7 @@ impl WikiClient {
                     size: page.length,
                     wordcount: None,
                     snippet: None,
+                    is_disambiguation: info_page_is_disambiguation(page),
                 })
             })
             .collect::<Vec<_>>();
@@ -1768,7 +1783,7 @@ impl WikiClient {
             ("action", "query".to_string()),
             ("format", "json".to_string()),
             ("formatversion", "2".to_string()),
-            ("prop", "info".to_string()),
+            ("prop", "info|pageprops".to_string()),
             ("pageids", page_id.to_string()),
             ("redirects", "1".to_string()),
         ];
@@ -1900,8 +1915,8 @@ impl WikiClient {
             .unwrap_or_else(|| html_to_text(&html));
         let length = (!extract.is_empty()).then_some(extract.chars().count());
         let is_disambiguation = is_disambiguation_page(&parsed, &html);
-        let disambiguation_links = if is_disambiguation {
-            mediawiki_disambiguation_links(language, &html)
+        let disambiguation_groups = if is_disambiguation {
+            mediawiki_disambiguation_link_groups(language, &html)
         } else {
             Vec::new()
         };
@@ -1923,7 +1938,7 @@ impl WikiClient {
             body_links,
             nav_templates: mediawiki_nav_templates(language, &html),
             is_disambiguation,
-            disambiguation_links,
+            disambiguation_groups,
         })
     }
 
@@ -1992,6 +2007,46 @@ impl WikiClient {
                     size: page.length,
                     wordcount: None,
                     snippet: None,
+                    is_disambiguation: info_page_is_disambiguation(page),
+                })
+            })
+            .collect())
+    }
+
+    async fn article_button_groups_for_link_groups(
+        &self,
+        language: &str,
+        groups: &[DisambiguationLinkGroup],
+    ) -> Result<Vec<ArticleButtonGroup>> {
+        let titles = groups
+            .iter()
+            .flat_map(|group| group.links.iter())
+            .take(ARTICLE_TITLE_LOOKUP_LIMIT)
+            .map(|link| link.page_title.clone())
+            .collect::<Vec<_>>();
+        let pages_by_title = self.article_pages_by_titles(language, &titles).await?;
+
+        Ok(groups
+            .iter()
+            .filter_map(|group| {
+                let buttons = group
+                    .links
+                    .iter()
+                    .filter_map(|link| {
+                        let page = pages_by_title.get(&normalized_title_key(&link.page_title))?;
+                        Some(ArticleButton {
+                            page_id: page.pageid?,
+                            title: link.label.clone(),
+                            size: page.length,
+                            wordcount: None,
+                            snippet: None,
+                            is_disambiguation: info_page_is_disambiguation(page),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!buttons.is_empty()).then(|| ArticleButtonGroup {
+                    title: group.title.clone(),
+                    buttons,
                 })
             })
             .collect())
@@ -2031,6 +2086,7 @@ impl WikiClient {
                             size: page.length,
                             wordcount: None,
                             snippet: None,
+                            is_disambiguation: info_page_is_disambiguation(page),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -3502,6 +3558,9 @@ fn article_results_keyboard(
         .iter()
         .map(|result| {
             let mut label = result.title.clone();
+            if result.is_disambiguation {
+                label = format!("{DISAMBIGUATION_BUTTON_PREFIX}{label}");
+            }
             if let Some(wordcount) = result.wordcount {
                 label.push_str(&format!(" ({wordcount} words)"));
             }
@@ -4390,72 +4449,132 @@ fn is_disambiguation_page(parsed: &ParsedPage, html: &str) -> bool {
         || html.contains("dmbox-disambig")
 }
 
-fn mediawiki_disambiguation_links(language: &str, html: &str) -> Vec<NavLink> {
+fn mediawiki_disambiguation_link_groups(
+    language: &str,
+    html: &str,
+) -> Vec<DisambiguationLinkGroup> {
     let document = Html::parse_fragment(html);
-    let list_item_selector = Selector::parse("li").expect("list item selector is valid");
+    let selector =
+        Selector::parse("h2, h3, h4, h5, h6, li").expect("disambiguation selector is valid");
     let link_selector = Selector::parse("a[href]").expect("link selector is valid");
+    let mut current_group = "Other uses".to_string();
     let mut seen = HashSet::new();
-    let mut links = Vec::new();
+    let mut groups = Vec::new();
+    let mut link_count = 0;
 
-    for item in document.select(&list_item_selector) {
-        if element_or_ancestor_has_class_part(
-            item,
-            &[
-                "metadata",
-                "navbox",
-                "sistersitebox",
-                "selfreference",
-                "reflist",
-                "reference",
-                "portal",
-                "noprint",
-            ],
-        ) {
+    for element in document.select(&selector) {
+        if should_skip_disambiguation_element(element) {
             continue;
         }
 
-        let Some(link) = item.select(&link_selector).find(|link| {
-            !element_has_class_part(*link, &["selflink", "new", "mw-disambig"])
-                && link
-                    .value()
-                    .attr("href")
-                    .and_then(wiki_article_title_from_href)
-                    .is_some()
-        }) else {
-            continue;
-        };
+        match element.value().name() {
+            "h2" | "h3" | "h4" | "h5" | "h6" => {
+                if let Some(title) = disambiguation_heading_text(language, element) {
+                    current_group = title;
+                }
+            }
+            "li" => {
+                let Some(link) = disambiguation_link_from_list_item(
+                    language,
+                    element,
+                    &link_selector,
+                    &mut seen,
+                ) else {
+                    continue;
+                };
 
-        let Some(page_title) = link
-            .value()
-            .attr("href")
-            .and_then(wiki_article_title_from_href)
-        else {
-            continue;
-        };
+                push_disambiguation_link_group(&mut groups, &current_group, link);
+                link_count += 1;
 
-        let key = normalized_title_key(&page_title);
-        if !seen.insert(key) {
-            continue;
-        }
-
-        let label = trim_html_spacing(&render_inline_element(language, link));
-        let label = html_to_plain_text(&label);
-        let label = label.trim();
-        links.push(NavLink {
-            label: if label.is_empty() {
-                page_title.clone()
-            } else {
-                label.to_string()
-            },
-            page_title,
-        });
-
-        if links.len() >= DISAMBIGUATION_LINK_LIMIT {
-            break;
+                if link_count >= DISAMBIGUATION_LINK_LIMIT {
+                    break;
+                }
+            }
+            _ => {}
         }
     }
 
-    links
+    groups
+}
+
+fn should_skip_disambiguation_element(element: ElementRef<'_>) -> bool {
+    element_or_ancestor_has_class_part(
+        element,
+        &[
+            "metadata",
+            "navbox",
+            "sistersitebox",
+            "selfreference",
+            "reflist",
+            "reference",
+            "portal",
+            "noprint",
+            "toc",
+        ],
+    )
+}
+
+fn disambiguation_heading_text(language: &str, heading: ElementRef<'_>) -> Option<String> {
+    let rendered = trim_html_spacing(&render_inline_element(language, heading));
+    let title = html_to_plain_text(&rendered);
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty() && !is_terminal_article_heading(&title)).then_some(title)
+}
+
+fn disambiguation_link_from_list_item(
+    language: &str,
+    item: ElementRef<'_>,
+    link_selector: &Selector,
+    seen: &mut HashSet<String>,
+) -> Option<NavLink> {
+    let link = item.select(link_selector).find(|link| {
+        !element_has_class_part(*link, &["selflink", "new", "mw-disambig"])
+            && link
+                .value()
+                .attr("href")
+                .and_then(wiki_article_title_from_href)
+                .is_some()
+    })?;
+
+    let page_title = link
+        .value()
+        .attr("href")
+        .and_then(wiki_article_title_from_href)?;
+
+    let key = normalized_title_key(&page_title);
+    if !seen.insert(key) {
+        return None;
+    }
+
+    let label = trim_html_spacing(&render_inline_element(language, link));
+    let label = html_to_plain_text(&label);
+    let label = label.trim();
+    Some(NavLink {
+        label: if label.is_empty() {
+            page_title.clone()
+        } else {
+            label.to_string()
+        },
+        page_title,
+    })
+}
+
+fn push_disambiguation_link_group(
+    groups: &mut Vec<DisambiguationLinkGroup>,
+    title: &str,
+    link: NavLink,
+) {
+    if let Some(group) = groups.last_mut()
+        && group.title == title
+    {
+        group.links.push(link);
+        return;
+    }
+
+    groups.push(DisambiguationLinkGroup {
+        title: title.to_string(),
+        links: vec![link],
+    });
 }
 
 fn mediawiki_body_links(language: &str, article_title: &str, html: &str) -> Vec<NavLink> {
@@ -4653,6 +4772,12 @@ fn normalized_title_key(title: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn info_page_is_disambiguation(page: &InfoPage) -> bool {
+    page.pageprops
+        .as_ref()
+        .is_some_and(|props| props.contains_key("disambiguation"))
 }
 
 fn render_reference_item(language: &str, item: ElementRef<'_>) -> Option<String> {
@@ -6783,6 +6908,7 @@ struct ArticleButton {
     size: Option<usize>,
     wordcount: Option<usize>,
     snippet: Option<String>,
+    is_disambiguation: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -6798,7 +6924,7 @@ struct ArticleContent {
     body_links: Vec<NavLink>,
     nav_templates: Vec<NavTemplate>,
     is_disambiguation: bool,
-    disambiguation_links: Vec<NavLink>,
+    disambiguation_groups: Vec<DisambiguationLinkGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6825,6 +6951,18 @@ struct NavTemplate {
 struct NavLink {
     label: String,
     page_title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisambiguationLinkGroup {
+    title: String,
+    links: Vec<NavLink>,
+}
+
+#[derive(Debug, Clone)]
+struct ArticleButtonGroup {
+    title: String,
+    buttons: Vec<ArticleButton>,
 }
 
 #[derive(Debug, Clone)]
@@ -7005,11 +7143,7 @@ struct SearchQuery {
 
 #[derive(Debug, Deserialize)]
 struct SearchHit {
-    pageid: u64,
     title: String,
-    snippet: Option<String>,
-    size: Option<usize>,
-    wordcount: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7732,6 +7866,7 @@ mod tests {
                 size: Some(2000),
                 wordcount: None,
                 snippet: None,
+                is_disambiguation: false,
             }],
             DEFAULT_BIG_ARTICLE_CHAR_THRESHOLD,
             DEFAULT_SMALL_ARTICLE_CHAR_THRESHOLD,
@@ -7887,6 +8022,7 @@ mod tests {
                 size: Some(DEFAULT_BIG_ARTICLE_CHAR_THRESHOLD),
                 wordcount: Some(9000),
                 snippet: None,
+                is_disambiguation: false,
             }],
             DEFAULT_BIG_ARTICLE_CHAR_THRESHOLD,
             DEFAULT_SMALL_ARTICLE_CHAR_THRESHOLD,
@@ -7907,6 +8043,7 @@ mod tests {
                 size: Some(DEFAULT_SMALL_ARTICLE_CHAR_THRESHOLD),
                 wordcount: Some(100),
                 snippet: None,
+                is_disambiguation: false,
             }],
             DEFAULT_BIG_ARTICLE_CHAR_THRESHOLD,
             DEFAULT_SMALL_ARTICLE_CHAR_THRESHOLD,
@@ -7915,6 +8052,27 @@ mod tests {
 
         assert_eq!(keyboard[0][0]["callback_data"], "article:en:43");
         assert_eq!(keyboard[0][0]["style"], "primary");
+    }
+
+    #[test]
+    fn disambiguation_result_buttons_use_emoji_marker() {
+        let keyboard = article_results_keyboard(
+            "en",
+            &[ArticleButton {
+                page_id: 45,
+                title: "Kitty".to_string(),
+                size: Some(1200),
+                wordcount: None,
+                snippet: None,
+                is_disambiguation: true,
+            }],
+            DEFAULT_BIG_ARTICLE_CHAR_THRESHOLD,
+            DEFAULT_SMALL_ARTICLE_CHAR_THRESHOLD,
+            false,
+        );
+
+        assert_eq!(keyboard[0][0]["text"], "🔀 Kitty");
+        assert_eq!(keyboard[0][0]["callback_data"], "article:en:45");
     }
 
     #[test]
@@ -7927,6 +8085,7 @@ mod tests {
                 size: Some(10_000),
                 wordcount: None,
                 snippet: None,
+                is_disambiguation: false,
             }],
             DEFAULT_BIG_ARTICLE_CHAR_THRESHOLD * 10,
             DEFAULT_SMALL_ARTICLE_CHAR_THRESHOLD,
@@ -8021,7 +8180,7 @@ mod tests {
             body_links: Vec::new(),
             nav_templates: Vec::new(),
             is_disambiguation: false,
-            disambiguation_links: Vec::new(),
+            disambiguation_groups: Vec::new(),
         };
         let rendered = render_article_html_parts("en", &article, 3900).join("\n\n");
 
@@ -8054,7 +8213,7 @@ mod tests {
             body_links: Vec::new(),
             nav_templates: Vec::new(),
             is_disambiguation: false,
-            disambiguation_links: Vec::new(),
+            disambiguation_groups: Vec::new(),
         };
 
         let parts = render_article_html_parts("en", &article, 650);
@@ -8093,7 +8252,7 @@ mod tests {
             body_links: Vec::new(),
             nav_templates: Vec::new(),
             is_disambiguation: false,
-            disambiguation_links: Vec::new(),
+            disambiguation_groups: Vec::new(),
         };
 
         let parts = render_article_html_parts("en", &article, 320);
@@ -8472,17 +8631,20 @@ mod tests {
 
         assert!(is_disambiguation_page(&parsed, html));
         assert_eq!(
-            mediawiki_disambiguation_links("en", html),
-            vec![
-                NavLink {
-                    label: "Mercury (planet)".to_string(),
-                    page_title: "Mercury (planet)".to_string(),
-                },
-                NavLink {
-                    label: "Mercury (element)".to_string(),
-                    page_title: "Mercury (element)".to_string(),
-                },
-            ]
+            mediawiki_disambiguation_link_groups("en", html),
+            vec![DisambiguationLinkGroup {
+                title: "Other uses".to_string(),
+                links: vec![
+                    NavLink {
+                        label: "Mercury (planet)".to_string(),
+                        page_title: "Mercury (planet)".to_string(),
+                    },
+                    NavLink {
+                        label: "Mercury (element)".to_string(),
+                        page_title: "Mercury (element)".to_string(),
+                    },
+                ],
+            }]
         );
 
         let article = ArticleContent {
@@ -8497,12 +8659,105 @@ mod tests {
             body_links: Vec::new(),
             nav_templates: Vec::new(),
             is_disambiguation: true,
-            disambiguation_links: mediawiki_disambiguation_links("en", html),
+            disambiguation_groups: mediawiki_disambiguation_link_groups("en", html),
         };
         let rendered = render_article_html_parts("en", &article, 3900).join("\n\n");
         assert!(rendered.contains("Disambiguation page"));
         assert!(rendered.contains("Choose a target article"));
         assert!(!rendered.contains("This body must not be dumped"));
+    }
+
+    #[test]
+    fn disambiguation_links_are_grouped_by_section_heading() {
+        let html = r#"
+            <p><b>Kitty</b> may refer to:</p>
+            <h2><span id="Animals">Animals</span></h2>
+            <ul>
+              <li><a href="/wiki/Cat">Cat</a>, a small domesticated mammal
+                <ul>
+                  <li><a href="/wiki/Kitten">Kitten</a>, a young cat</li>
+                </ul>
+              </li>
+            </ul>
+            <h2><span id="Film">Film</span></h2>
+            <ul>
+              <li><a href="/wiki/Kitty_Films">Kitty Films</a>, an anime production company</li>
+            </ul>
+            <h2><span id="Games_and_money">Games and money</span></h2>
+            <ul>
+              <li>Kitty, <a href="/wiki/Glossary_of_poker_terms">in poker terminology</a>, a pool of money</li>
+            </ul>
+            <h2><span id="Music">Music</span></h2>
+            <ul>
+              <li><a href="/wiki/Kitty_(musician)">Kitty (musician)</a></li>
+            </ul>
+            <h2><span id="Other_uses">Other uses</span></h2>
+            <ul>
+              <li><a href="/wiki/Kitty_(given_name)">Kitty (given name)</a></li>
+            </ul>
+            <h2><span id="See_also">See also</span></h2>
+            <ul>
+              <li><a href="/wiki/Kittie">Kittie</a></li>
+              <li><a class="mw-disambig" href="/wiki/Hello_Kitty_(disambiguation)">Hello Kitty</a></li>
+              <li><a href="/wiki/Category:Disambiguation_pages">Category</a></li>
+            </ul>
+        "#;
+
+        let groups = mediawiki_disambiguation_link_groups("en", html);
+
+        assert_eq!(
+            groups,
+            vec![
+                DisambiguationLinkGroup {
+                    title: "Animals".to_string(),
+                    links: vec![
+                        NavLink {
+                            label: "Cat".to_string(),
+                            page_title: "Cat".to_string(),
+                        },
+                        NavLink {
+                            label: "Kitten".to_string(),
+                            page_title: "Kitten".to_string(),
+                        },
+                    ],
+                },
+                DisambiguationLinkGroup {
+                    title: "Film".to_string(),
+                    links: vec![NavLink {
+                        label: "Kitty Films".to_string(),
+                        page_title: "Kitty Films".to_string(),
+                    }],
+                },
+                DisambiguationLinkGroup {
+                    title: "Games and money".to_string(),
+                    links: vec![NavLink {
+                        label: "in poker terminology".to_string(),
+                        page_title: "Glossary of poker terms".to_string(),
+                    }],
+                },
+                DisambiguationLinkGroup {
+                    title: "Music".to_string(),
+                    links: vec![NavLink {
+                        label: "Kitty (musician)".to_string(),
+                        page_title: "Kitty (musician)".to_string(),
+                    }],
+                },
+                DisambiguationLinkGroup {
+                    title: "Other uses".to_string(),
+                    links: vec![NavLink {
+                        label: "Kitty (given name)".to_string(),
+                        page_title: "Kitty (given name)".to_string(),
+                    }],
+                },
+                DisambiguationLinkGroup {
+                    title: "See also".to_string(),
+                    links: vec![NavLink {
+                        label: "Kittie".to_string(),
+                        page_title: "Kittie".to_string(),
+                    }],
+                },
+            ]
+        );
     }
 
     #[test]
@@ -8536,6 +8791,7 @@ mod tests {
                 size: Some(1200),
                 wordcount: Some(180),
                 snippet: Some("Batumi railway station serves Batumi in Adjara.".to_string()),
+                is_disambiguation: false,
             }],
         );
 
@@ -8578,6 +8834,7 @@ mod tests {
             size: Some(10_000),
             wordcount: None,
             snippet: Some("Long sentence. ".repeat(500)),
+            is_disambiguation: false,
         };
         let message = inline_message_text("en", &result, "https://en.wikipedia.org/wiki/Long");
         assert!(message.chars().count() <= INLINE_MESSAGE_CHAR_LIMIT);

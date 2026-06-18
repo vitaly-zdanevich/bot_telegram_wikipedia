@@ -56,8 +56,9 @@ Public bot: https://t.me/wikipedia_unofficial_bot
 - Preserve inline code and blockquote formatting when Wikipedia exposes those
   elements in parsed HTML.
 - Render ordinary article tables as pipe-separated rows with links preserved.
-- Detect disambiguation pages and show target-article buttons instead of dumping
-  the disambiguation page body.
+- Detect disambiguation pages and show target-article buttons grouped by
+  section instead of dumping the disambiguation page body.
+- Mark buttons that open disambiguation pages with an emoji.
 - Send references as a separate message after the article body, with extracted
   URLs printed visibly under each citation.
 - Split articles into multiple Telegram messages under `TELEGRAM_MESSAGE_CHAR_LIMIT`.
