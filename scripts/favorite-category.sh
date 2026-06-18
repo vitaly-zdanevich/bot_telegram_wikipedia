@@ -57,7 +57,8 @@ favorite_value() {
 
 entry_from_args() {
   if [[ $# -eq 1 ]]; then
-    trim "$1"
+    local entry="$1"
+    trim "$entry"
     return
   fi
 

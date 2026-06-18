@@ -840,221 +840,369 @@ impl App {
             }
         };
 
-        let mut categories_task: Option<JoinHandle<Result<Vec<Category>>>> = None;
-        let mut body_links_task: Option<JoinHandle<Result<Vec<ArticleButton>>>> = None;
-        let mut navigation_task: Option<JoinHandle<Result<Vec<NavTemplateButtons>>>> = None;
-        let mut disambiguation_task: Option<JoinHandle<Result<Vec<ArticleButtonGroup>>>> = None;
-        let mut metadata_task: Option<JoinHandle<Result<ArticleMetadata>>> = None;
-        let mut media_task: Option<JoinHandle<Result<ArticleMedia>>> = None;
+        let mut followups = ArticleFollowupTasks::default();
+        let inline_images = self
+            .send_article_body_parts(chat_id, &language, page_id, &article, &mut followups)
+            .await?;
 
-        let parts =
-            render_article_output_parts(&language, &article, self.config.message_char_limit);
-        let mut started_followups = false;
+        self.send_article_references(chat_id, &article).await?;
+        self.send_article_followups(
+            chat_id,
+            &language,
+            page_id,
+            &article,
+            followups,
+            &inline_images,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sends the already-rendered article body and starts follow-up network work
+    /// only after Telegram has accepted the first text message.
+    async fn send_article_body_parts(
+        &self,
+        chat_id: i64,
+        language: &str,
+        page_id: u64,
+        article: &ArticleContent,
+        followups: &mut ArticleFollowupTasks,
+    ) -> Result<Vec<MediaItem>> {
+        let parts = render_article_output_parts(language, article, self.config.message_char_limit);
         let mut inline_images = Vec::new();
+
         for part in parts {
             match part {
                 ArticleOutputPart::Html(html) => {
                     self.send_html_message(chat_id, &html, None).await?;
+                    if !followups.started {
+                        *followups = self.start_article_followups(language, page_id, article);
+                    }
                 }
                 ArticleOutputPart::Images(images) => {
                     if !self.config.article_images_button_only && !images.is_empty() {
                         self.send_image_gallery(chat_id, &images).await?;
                         inline_images.extend(images);
                     }
-                    continue;
                 }
-            }
-
-            if !started_followups {
-                started_followups = true;
-                categories_task = Some(spawn_wiki_task({
-                    let wiki = self.wiki.clone();
-                    let language = language.clone();
-                    async move { wiki.article_categories(&language, page_id).await }
-                }));
-
-                if !article.body_links.is_empty() {
-                    body_links_task = Some(spawn_wiki_task({
-                        let wiki = self.wiki.clone();
-                        let language = language.clone();
-                        let links = article.body_links.clone();
-                        async move { wiki.article_buttons_for_links(&language, &links).await }
-                    }));
-                }
-
-                if !article.nav_templates.is_empty() {
-                    navigation_task = Some(spawn_wiki_task({
-                        let wiki = self.wiki.clone();
-                        let language = language.clone();
-                        let nav_templates = article.nav_templates.clone();
-                        async move {
-                            wiki.article_buttons_for_nav_templates(&language, &nav_templates)
-                                .await
-                        }
-                    }));
-                }
-
-                if !article.disambiguation_groups.is_empty() {
-                    disambiguation_task = Some(spawn_wiki_task({
-                        let wiki = self.wiki.clone();
-                        let language = language.clone();
-                        let groups = article.disambiguation_groups.clone();
-                        async move {
-                            wiki.article_button_groups_for_link_groups(&language, &groups)
-                                .await
-                        }
-                    }));
-                }
-
-                metadata_task = Some(spawn_wiki_task({
-                    let wiki = self.wiki.clone();
-                    let language = language.clone();
-                    let revision_limit = self.config.metadata_revision_limit;
-                    async move {
-                        wiki.article_metadata(&language, page_id, revision_limit)
-                            .await
-                    }
-                }));
-
-                media_task = Some(spawn_wiki_task({
-                    let wiki = self.wiki.clone();
-                    let language = language.clone();
-                    async move { wiki.article_media(&language, page_id).await }
-                }));
             }
         }
 
-        if let Some(references_html) = article
+        Ok(inline_images)
+    }
+
+    /// Starts all article follow-up fetches in parallel.
+    fn start_article_followups(
+        &self,
+        language: &str,
+        page_id: u64,
+        article: &ArticleContent,
+    ) -> ArticleFollowupTasks {
+        let categories = Some(spawn_wiki_task({
+            let wiki = self.wiki.clone();
+            let language = language.to_string();
+            async move { wiki.article_categories(&language, page_id).await }
+        }));
+
+        let body_links = (!article.body_links.is_empty()).then(|| {
+            spawn_wiki_task({
+                let wiki = self.wiki.clone();
+                let language = language.to_string();
+                let links = article.body_links.clone();
+                async move { wiki.article_buttons_for_links(&language, &links).await }
+            })
+        });
+
+        let navigation = (!article.nav_templates.is_empty()).then(|| {
+            spawn_wiki_task({
+                let wiki = self.wiki.clone();
+                let language = language.to_string();
+                let nav_templates = article.nav_templates.clone();
+                async move {
+                    wiki.article_buttons_for_nav_templates(&language, &nav_templates)
+                        .await
+                }
+            })
+        });
+
+        let disambiguation = (!article.disambiguation_groups.is_empty()).then(|| {
+            spawn_wiki_task({
+                let wiki = self.wiki.clone();
+                let language = language.to_string();
+                let groups = article.disambiguation_groups.clone();
+                async move {
+                    wiki.article_button_groups_for_link_groups(&language, &groups)
+                        .await
+                }
+            })
+        });
+
+        let metadata = Some(spawn_wiki_task({
+            let wiki = self.wiki.clone();
+            let language = language.to_string();
+            let revision_limit = self.config.metadata_revision_limit;
+            async move {
+                wiki.article_metadata(&language, page_id, revision_limit)
+                    .await
+            }
+        }));
+
+        let media = Some(spawn_wiki_task({
+            let wiki = self.wiki.clone();
+            let language = language.to_string();
+            async move { wiki.article_media(&language, page_id).await }
+        }));
+
+        ArticleFollowupTasks {
+            started: true,
+            categories,
+            body_links,
+            navigation,
+            disambiguation,
+            metadata,
+            media,
+        }
+    }
+
+    /// Sends article references after the body and before link/navigation buttons.
+    async fn send_article_references(&self, chat_id: i64, article: &ArticleContent) -> Result<()> {
+        let Some(references_html) = article
             .references_html
             .as_deref()
             .map(str::trim)
             .filter(|references| !references.is_empty())
-        {
-            for part in
-                render_references_html_parts(references_html, self.config.message_char_limit)
-            {
-                self.send_html_message(chat_id, &part, None).await?;
+        else {
+            return Ok(());
+        };
+
+        for part in render_references_html_parts(references_html, self.config.message_char_limit) {
+            self.send_html_message(chat_id, &part, None).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Sends the article follow-up messages in the user-facing order.
+    async fn send_article_followups(
+        &self,
+        chat_id: i64,
+        language: &str,
+        page_id: u64,
+        article: &ArticleContent,
+        mut tasks: ArticleFollowupTasks,
+        inline_images: &[MediaItem],
+    ) -> Result<()> {
+        self.send_article_body_links_followup(chat_id, language, tasks.body_links.take())
+            .await?;
+        self.send_article_disambiguation_followup(chat_id, language, tasks.disambiguation.take())
+            .await?;
+        self.send_article_navigation_followup(chat_id, language, tasks.navigation.take())
+            .await?;
+        self.send_article_categories_followup(chat_id, language, page_id, tasks.categories.take())
+            .await?;
+        self.send_article_metadata_followup(chat_id, tasks.metadata.take())
+            .await?;
+        self.send_article_media_followup(
+            chat_id,
+            language,
+            page_id,
+            article,
+            tasks.media.take(),
+            inline_images,
+        )
+        .await
+    }
+
+    /// Sends the article-body link buttons if their lookup succeeded.
+    async fn send_article_body_links_followup(
+        &self,
+        chat_id: i64,
+        language: &str,
+        task: Option<JoinHandle<Result<Vec<ArticleButton>>>>,
+    ) -> Result<()> {
+        let Some(task) = task else {
+            return Ok(());
+        };
+
+        match join_task(task).await {
+            Ok(links) => {
+                self.send_article_buttons_message(chat_id, language, "Article links", &links)
+                    .await?;
+            }
+            Err(err) => {
+                warn!(error = %format_error_chain(&err), "failed to fetch article body links")
             }
         }
 
-        if let Some(body_links_task) = body_links_task {
-            match join_task(body_links_task).await {
-                Ok(links) => {
-                    self.send_article_buttons_message(chat_id, &language, "Article links", &links)
-                        .await?;
-                }
-                Err(err) => {
-                    warn!(error = %format_error_chain(&err), "failed to fetch article body links")
-                }
-            }
-        }
+        Ok(())
+    }
 
-        if let Some(disambiguation_task) = disambiguation_task {
-            match join_task(disambiguation_task).await {
-                Ok(groups) => {
-                    for group in groups {
-                        self.send_article_buttons_message(
-                            chat_id,
-                            &language,
-                            &format!("Disambiguation: {}", group.title),
-                            &group.buttons,
-                        )
-                        .await?;
-                    }
-                }
-                Err(err) => {
-                    warn!(error = %format_error_chain(&err), "failed to fetch disambiguation links")
-                }
-            }
-        }
+    /// Sends grouped disambiguation target buttons.
+    async fn send_article_disambiguation_followup(
+        &self,
+        chat_id: i64,
+        language: &str,
+        task: Option<JoinHandle<Result<Vec<ArticleButtonGroup>>>>,
+    ) -> Result<()> {
+        let Some(task) = task else {
+            return Ok(());
+        };
 
-        if let Some(navigation_task) = navigation_task {
-            match join_task(navigation_task).await {
-                Ok(templates) => {
-                    for template in templates {
-                        if template.buttons.is_empty() {
-                            continue;
-                        }
-                        self.send_article_buttons_message_with_heading_html(
-                            chat_id,
-                            &language,
-                            &render_navigation_heading_html(&template),
-                            &template.buttons,
-                        )
-                        .await?;
-                    }
-                }
-                Err(err) => {
-                    warn!(error = %format_error_chain(&err), "failed to fetch navigation template links")
-                }
-            }
-        }
-
-        if let Some(categories_task) = categories_task {
-            match join_task(categories_task).await {
-                Ok(categories) => {
-                    if !categories.is_empty() {
-                        let categories_html = render_categories_html(&language, &categories);
-                        self.send_html_message(
-                            chat_id,
-                            &categories_html,
-                            article_categories_keyboard(&language, page_id, &categories),
-                        )
-                        .await?;
-                    }
-                }
-                Err(err) => warn!(error = %err, "failed to fetch article categories"),
-            }
-        }
-
-        if let Some(metadata_task) = metadata_task {
-            match join_task(metadata_task).await {
-                Ok(metadata) => {
-                    let metadata_html = render_metadata_html(&metadata);
-                    let metadata_parts = split_html_lines_for_telegram(
-                        &metadata_html,
-                        self.config.message_char_limit,
-                    );
-                    let wikidata_keyboard = wikidata_metadata_keyboard(&metadata);
-                    for (index, part) in metadata_parts.iter().enumerate() {
-                        self.send_html_message(
-                            chat_id,
-                            part,
-                            if index == 0 {
-                                wikidata_keyboard.clone()
-                            } else {
-                                None
-                            },
-                        )
-                        .await?;
-                    }
-                }
-                Err(err) => {
-                    warn!(error = %err, "failed to fetch article metadata");
-                    self.send_message(chat_id, "Metadata fetch failed.", None)
-                        .await?;
-                }
-            }
-        }
-
-        if let Some(media_task) = media_task {
-            match join_task(media_task).await {
-                Ok(media) => {
-                    self.send_media(
+        match join_task(task).await {
+            Ok(groups) => {
+                for group in groups {
+                    self.send_article_buttons_message(
                         chat_id,
-                        ArticleMediaSend {
-                            language: &language,
-                            page_id,
-                            title: &article.title,
-                            media: &media,
-                            infobox_image: article.infobox_image.as_ref(),
-                            excluded_images: &inline_images,
+                        language,
+                        &format!("Disambiguation: {}", group.title),
+                        &group.buttons,
+                    )
+                    .await?;
+                }
+            }
+            Err(err) => {
+                warn!(error = %format_error_chain(&err), "failed to fetch disambiguation links")
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sends navigation-template buttons.
+    async fn send_article_navigation_followup(
+        &self,
+        chat_id: i64,
+        language: &str,
+        task: Option<JoinHandle<Result<Vec<NavTemplateButtons>>>>,
+    ) -> Result<()> {
+        let Some(task) = task else {
+            return Ok(());
+        };
+
+        match join_task(task).await {
+            Ok(templates) => {
+                for template in templates {
+                    if template.buttons.is_empty() {
+                        continue;
+                    }
+                    self.send_article_buttons_message_with_heading_html(
+                        chat_id,
+                        language,
+                        &render_navigation_heading_html(&template),
+                        &template.buttons,
+                    )
+                    .await?;
+                }
+            }
+            Err(err) => {
+                warn!(error = %format_error_chain(&err), "failed to fetch navigation template links")
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sends article categories and their callback buttons.
+    async fn send_article_categories_followup(
+        &self,
+        chat_id: i64,
+        language: &str,
+        page_id: u64,
+        task: Option<JoinHandle<Result<Vec<Category>>>>,
+    ) -> Result<()> {
+        let Some(task) = task else {
+            return Ok(());
+        };
+
+        match join_task(task).await {
+            Ok(categories) => {
+                if !categories.is_empty() {
+                    let categories_html = render_categories_html(language, &categories);
+                    self.send_html_message(
+                        chat_id,
+                        &categories_html,
+                        article_categories_keyboard(language, page_id, &categories),
+                    )
+                    .await?;
+                }
+            }
+            Err(err) => warn!(error = %err, "failed to fetch article categories"),
+        }
+
+        Ok(())
+    }
+
+    /// Sends article metadata with the Wikidata button on the first part.
+    async fn send_article_metadata_followup(
+        &self,
+        chat_id: i64,
+        task: Option<JoinHandle<Result<ArticleMetadata>>>,
+    ) -> Result<()> {
+        let Some(task) = task else {
+            return Ok(());
+        };
+
+        match join_task(task).await {
+            Ok(metadata) => {
+                let metadata_html = render_metadata_html(&metadata);
+                let metadata_parts =
+                    split_html_lines_for_telegram(&metadata_html, self.config.message_char_limit);
+                let wikidata_keyboard = wikidata_metadata_keyboard(&metadata);
+                for (index, part) in metadata_parts.iter().enumerate() {
+                    self.send_html_message(
+                        chat_id,
+                        part,
+                        if index == 0 {
+                            wikidata_keyboard.clone()
+                        } else {
+                            None
                         },
                     )
-                    .await?
+                    .await?;
                 }
-                Err(err) => warn!(error = %err, "failed to fetch article media"),
             }
+            Err(err) => {
+                warn!(error = %err, "failed to fetch article metadata");
+                self.send_message(chat_id, "Metadata fetch failed.", None)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sends article media while skipping images already emitted inline with
+    /// body sections.
+    async fn send_article_media_followup(
+        &self,
+        chat_id: i64,
+        language: &str,
+        page_id: u64,
+        article: &ArticleContent,
+        task: Option<JoinHandle<Result<ArticleMedia>>>,
+        inline_images: &[MediaItem],
+    ) -> Result<()> {
+        let Some(task) = task else {
+            return Ok(());
+        };
+
+        match join_task(task).await {
+            Ok(media) => {
+                self.send_media(
+                    chat_id,
+                    ArticleMediaSend {
+                        language,
+                        page_id,
+                        title: &article.title,
+                        media: &media,
+                        infobox_image: article.infobox_image.as_ref(),
+                        excluded_images: inline_images,
+                    },
+                )
+                .await?
+            }
+            Err(err) => warn!(error = %err, "failed to fetch article media"),
         }
 
         Ok(())
@@ -1472,6 +1620,17 @@ impl App {
 
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct ArticleFollowupTasks {
+    started: bool,
+    categories: Option<JoinHandle<Result<Vec<Category>>>>,
+    body_links: Option<JoinHandle<Result<Vec<ArticleButton>>>>,
+    navigation: Option<JoinHandle<Result<Vec<NavTemplateButtons>>>>,
+    disambiguation: Option<JoinHandle<Result<Vec<ArticleButtonGroup>>>>,
+    metadata: Option<JoinHandle<Result<ArticleMetadata>>>,
+    media: Option<JoinHandle<Result<ArticleMedia>>>,
 }
 
 #[derive(Clone)]
@@ -3444,155 +3603,181 @@ fn parse_callback_data(
     favorite_categories: &[FavoriteCategory],
 ) -> Result<CallbackAction> {
     if let Some(rest) = data.strip_prefix("article:") {
-        let mut parts = rest.split(':');
-        let language = parts
-            .next()
-            .and_then(normalize_language_code)
-            .context("article callback has invalid language")?;
-        let page_id = parts
-            .next()
-            .context("article callback has no page id")?
-            .parse::<u64>()
-            .context("article callback page id is invalid")?;
-        if parts.next().is_some() {
-            bail!("article callback has extra fields");
-        }
-        return Ok(CallbackAction::Article { language, page_id });
+        return parse_article_callback(rest);
     }
 
     if let Some(rest) = data.strip_prefix("catpage:") {
-        let mut parts = rest.split(':');
-        let language = parts
-            .next()
-            .and_then(normalize_language_code)
-            .context("category page callback has invalid language")?;
-        let page_id = parts
-            .next()
-            .context("category page callback has no page id")?
-            .parse::<u64>()
-            .context("category page callback page id is invalid")?;
-        let kind = parts
-            .next()
-            .and_then(CategoryPageKind::from_callback_code)
-            .context("category page callback has invalid kind")?;
-        let page_index = parts
-            .next()
-            .context("category page callback has no page index")?
-            .parse::<usize>()
-            .context("category page callback page index is invalid")?;
-        let total_pages = parts
-            .next()
-            .map(|value| {
-                value
-                    .parse::<usize>()
-                    .context("category page callback total page count is invalid")
-            })
-            .transpose()?;
-        if parts.next().is_some() {
-            bail!("category page callback has extra fields");
-        }
-        return Ok(CallbackAction::CategoryPage {
-            language,
-            page_id,
-            kind,
-            page_index,
-            total_pages,
-        });
+        return parse_category_page_callback(rest);
     }
 
     if let Some(rest) = data.strip_prefix("article_category:") {
-        let mut parts = rest.split(':');
-        let language = parts
-            .next()
-            .and_then(normalize_language_code)
-            .context("article category callback has invalid language")?;
-        let page_id = parts
-            .next()
-            .context("article category callback has no page id")?
-            .parse::<u64>()
-            .context("article category callback page id is invalid")?;
-        let index = parts
-            .next()
-            .context("article category callback has no index")?
-            .parse::<usize>()
-            .context("article category callback index is invalid")?;
-        if parts.next().is_some() {
-            bail!("article category callback has extra fields");
-        }
-        return Ok(CallbackAction::ArticleCategory {
-            language,
-            page_id,
-            index,
-        });
+        return parse_article_category_callback(rest);
     }
 
     if let Some(rest) = data.strip_prefix("wikidata:") {
-        let mut parts = rest.split(':');
-        let language = parts
-            .next()
-            .and_then(normalize_language_code)
-            .context("Wikidata callback has invalid language")?;
-        let item = parts
-            .next()
-            .and_then(normalize_wikidata_entity_id)
-            .context("Wikidata callback has invalid item id")?;
-        if parts.next().is_some() {
-            bail!("Wikidata callback has extra fields");
-        }
-        return Ok(CallbackAction::Wikidata { language, item });
+        return parse_wikidata_callback(rest);
     }
 
     if let Some(rest) = data.strip_prefix("images:") {
-        let mut parts = rest.split(':');
-        let language = parts
-            .next()
-            .and_then(normalize_language_code)
-            .context("images callback has invalid language")?;
-        let page_id = parts
-            .next()
-            .context("images callback has no page id")?
-            .parse::<u64>()
-            .context("images callback page id is invalid")?;
-        if parts.next().is_some() {
-            bail!("images callback has extra fields");
-        }
-        return Ok(CallbackAction::Images { language, page_id });
+        return parse_images_callback(rest);
     }
 
     if let Some(rest) = data.strip_prefix("category:") {
-        let mut parts = rest.split(':');
-        let language = parts
-            .next()
-            .and_then(normalize_language_code)
-            .context("category callback has invalid language")?;
-        let encoded = parts.next().context("category callback has no title")?;
-        if parts.next().is_some() {
-            bail!("category callback has extra fields");
-        }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .context("category callback title is not base64url")?;
-        let title = String::from_utf8(bytes).context("category callback title is not utf-8")?;
-        return Ok(CallbackAction::Category {
-            title: normalize_category_title_for_language(&title, &language),
-            language,
-        });
+        return parse_category_callback(rest);
     }
 
     if let Some(rest) = data.strip_prefix("favorite_category:") {
-        let index = rest
-            .parse::<usize>()
-            .context("favorite category callback index is invalid")?;
-        let favorite = favorite_categories
-            .get(index)
-            .context("favorite category index is out of range")?;
-        return Ok(CallbackAction::Category {
-            language: favorite.language.clone(),
-            title: favorite.title.clone(),
-        });
+        return parse_favorite_category_callback(rest, favorite_categories);
     }
 
     bail!("unknown callback data")
+}
+
+/// Decodes an article button callback.
+fn parse_article_callback(rest: &str) -> Result<CallbackAction> {
+    let mut parts = rest.split(':');
+    let language = parse_callback_language(&mut parts, "article")?;
+    let page_id = parse_callback_page_id(&mut parts, "article")?;
+    ensure_no_callback_fields(&mut parts, "article")?;
+    Ok(CallbackAction::Article { language, page_id })
+}
+
+/// Decodes a paginated category callback.
+fn parse_category_page_callback(rest: &str) -> Result<CallbackAction> {
+    let mut parts = rest.split(':');
+    let language = parse_callback_language(&mut parts, "category page")?;
+    let page_id = parse_callback_page_id(&mut parts, "category page")?;
+    let kind = parts
+        .next()
+        .and_then(CategoryPageKind::from_callback_code)
+        .context("category page callback has invalid kind")?;
+    let page_index = parts
+        .next()
+        .context("category page callback has no page index")?
+        .parse::<usize>()
+        .context("category page callback page index is invalid")?;
+    let total_pages = parts
+        .next()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .context("category page callback total page count is invalid")
+        })
+        .transpose()?;
+    ensure_no_callback_fields(&mut parts, "category page")?;
+    Ok(CallbackAction::CategoryPage {
+        language,
+        page_id,
+        kind,
+        page_index,
+        total_pages,
+    })
+}
+
+/// Decodes a callback for one category attached to an article.
+fn parse_article_category_callback(rest: &str) -> Result<CallbackAction> {
+    let mut parts = rest.split(':');
+    let language = parse_callback_language(&mut parts, "article category")?;
+    let page_id = parse_callback_page_id(&mut parts, "article category")?;
+    let index = parts
+        .next()
+        .context("article category callback has no index")?
+        .parse::<usize>()
+        .context("article category callback index is invalid")?;
+    ensure_no_callback_fields(&mut parts, "article category")?;
+    Ok(CallbackAction::ArticleCategory {
+        language,
+        page_id,
+        index,
+    })
+}
+
+/// Decodes a Wikidata metadata callback.
+fn parse_wikidata_callback(rest: &str) -> Result<CallbackAction> {
+    let mut parts = rest.split(':');
+    let language = parse_callback_language(&mut parts, "Wikidata")?;
+    let item = parts
+        .next()
+        .and_then(normalize_wikidata_entity_id)
+        .context("Wikidata callback has invalid item id")?;
+    ensure_no_callback_fields(&mut parts, "Wikidata")?;
+    Ok(CallbackAction::Wikidata { language, item })
+}
+
+/// Decodes an article image gallery callback.
+fn parse_images_callback(rest: &str) -> Result<CallbackAction> {
+    let mut parts = rest.split(':');
+    let language = parse_callback_language(&mut parts, "images")?;
+    let page_id = parse_callback_page_id(&mut parts, "images")?;
+    ensure_no_callback_fields(&mut parts, "images")?;
+    Ok(CallbackAction::Images { language, page_id })
+}
+
+/// Decodes a category-title callback whose title is base64url encoded.
+fn parse_category_callback(rest: &str) -> Result<CallbackAction> {
+    let mut parts = rest.split(':');
+    let language = parse_callback_language(&mut parts, "category")?;
+    let encoded = parts.next().context("category callback has no title")?;
+    ensure_no_callback_fields(&mut parts, "category")?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("category callback title is not base64url")?;
+    let title = String::from_utf8(bytes).context("category callback title is not utf-8")?;
+    Ok(CallbackAction::Category {
+        title: normalize_category_title_for_language(&title, &language),
+        language,
+    })
+}
+
+/// Decodes a callback pointing at a configured favorite category.
+fn parse_favorite_category_callback(
+    rest: &str,
+    favorite_categories: &[FavoriteCategory],
+) -> Result<CallbackAction> {
+    let index = rest
+        .parse::<usize>()
+        .context("favorite category callback index is invalid")?;
+    let favorite = favorite_categories
+        .get(index)
+        .context("favorite category index is out of range")?;
+    Ok(CallbackAction::Category {
+        language: favorite.language.clone(),
+        title: favorite.title.clone(),
+    })
+}
+
+/// Parses the language field shared by most callbacks.
+fn parse_callback_language(
+    parts: &mut std::str::Split<'_, char>,
+    callback_name: &str,
+) -> Result<String> {
+    parts
+        .next()
+        .and_then(normalize_language_code)
+        .with_context(|| format!("{callback_name} callback has invalid language"))
+}
+
+/// Parses the page id field shared by article and category-page callbacks.
+fn parse_callback_page_id(
+    parts: &mut std::str::Split<'_, char>,
+    callback_name: &str,
+) -> Result<u64> {
+    parts
+        .next()
+        .with_context(|| format!("{callback_name} callback has no page id"))?
+        .parse::<u64>()
+        .with_context(|| format!("{callback_name} callback page id is invalid"))
+}
+
+/// Rejects callback payloads with extra colon-separated fields.
+fn ensure_no_callback_fields(
+    parts: &mut std::str::Split<'_, char>,
+    callback_name: &str,
+) -> Result<()> {
+    if parts.next().is_some() {
+        bail!("{callback_name} callback has extra fields");
+    }
+    Ok(())
 }
 
 /// Builds Telegram inline query result cards for article suggestions.
@@ -5690,8 +5875,18 @@ fn article_infobox_limit(article_length: Option<usize>) -> usize {
 
 /// Renders article metadata as Telegram HTML.
 fn render_metadata_html(metadata: &ArticleMetadata) -> String {
-    let info = &metadata.info;
     let mut lines = Vec::new();
+    append_metadata_summary_lines(&mut lines, metadata);
+    append_metadata_pageview_lines(&mut lines, metadata);
+    append_metadata_language_lines(&mut lines, &metadata.language_links);
+    append_metadata_external_link_lines(&mut lines, &metadata.external_links);
+    append_article_revision_lines(&mut lines, &metadata.language, &metadata.revisions);
+    lines.join("\n")
+}
+
+/// Appends identity, URL, Wikidata, Commons, and coordinate fields.
+fn append_metadata_summary_lines(lines: &mut Vec<String>, metadata: &ArticleMetadata) {
+    let info = &metadata.info;
     lines.push(html_bold(&format!("Metadata for {}", info.title)));
     lines.push(format!(
         "Language: {}",
@@ -5737,24 +5932,34 @@ fn render_metadata_html(metadata: &ArticleMetadata) -> String {
         ));
     }
     if let Some(coordinate) = info.coordinates.first() {
-        lines.push(format!(
-            "Coordinates: {}{}",
-            html_link(
-                &coordinate_url(coordinate.lat, coordinate.lon),
-                &format!("{}, {}", coordinate.lat, coordinate.lon)
-            ),
-            coordinate
-                .globe
-                .as_ref()
-                .map(|globe| format!(" ({})", html_escape_text(globe)))
-                .unwrap_or_default()
-        ));
+        lines.push(metadata_coordinate_line(coordinate));
     }
+}
+
+/// Formats the first coordinate as a clickable map link.
+fn metadata_coordinate_line(coordinate: &Coordinate) -> String {
+    let globe = coordinate
+        .globe
+        .as_ref()
+        .map(|globe| format!(" ({})", html_escape_text(globe)))
+        .unwrap_or_default();
+    format!(
+        "Coordinates: {}{}",
+        html_link(
+            &coordinate_url(coordinate.lat, coordinate.lon),
+            &format!("{}, {}", coordinate.lat, coordinate.lon)
+        ),
+        globe
+    )
+}
+
+/// Appends pageview totals and the latest daily value.
+fn append_metadata_pageview_lines(lines: &mut Vec<String>, metadata: &ArticleMetadata) {
     if metadata.pageviews.days > 0 {
         lines.push(format!(
             "{}: {}",
             html_link(
-                &pageviews_url(&metadata.language, &info.title),
+                &pageviews_url(&metadata.language, &metadata.info.title),
                 &format!("Views last {} days", metadata.pageviews.days)
             ),
             metadata.pageviews.total
@@ -5767,67 +5972,87 @@ fn render_metadata_html(metadata: &ArticleMetadata) -> String {
             ));
         }
     }
-    lines.push(format!("Language links: {}", metadata.language_links.len()));
-    if !metadata.language_links.is_empty() {
+}
+
+/// Appends language-link counts and a compact language preview.
+fn append_metadata_language_lines(lines: &mut Vec<String>, language_links: &[LanguageLink]) {
+    lines.push(format!("Language links: {}", language_links.len()));
+    if !language_links.is_empty() {
         lines.push(format!(
             "Languages: {}",
-            metadata
-                .language_links
+            language_links
                 .iter()
                 .take(12)
-                .map(|link| {
-                    let label = link
-                        .langname
-                        .as_deref()
-                        .map(|name| format!("{} ({})", link.lang, name))
-                        .unwrap_or_else(|| link.lang.clone());
-                    html_escape_text(&label)
-                })
+                .map(metadata_language_link_label)
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
     }
-    lines.push(format!("External links: {}", metadata.external_links.len()));
-    for link in metadata.external_links.iter().take(8) {
+}
+
+/// Formats one language-link label.
+fn metadata_language_link_label(link: &LanguageLink) -> String {
+    let label = link
+        .langname
+        .as_deref()
+        .map(|name| format!("{} ({})", link.lang, name))
+        .unwrap_or_else(|| link.lang.clone());
+    html_escape_text(&label)
+}
+
+/// Appends external-link counts and the first few clickable URLs.
+fn append_metadata_external_link_lines(lines: &mut Vec<String>, external_links: &[String]) {
+    lines.push(format!("External links: {}", external_links.len()));
+    for link in external_links.iter().take(8) {
         lines.push(format!("External: {}", html_link(link, link)));
     }
+}
 
-    if !metadata.revisions.is_empty() {
+/// Appends recent article revisions.
+fn append_article_revision_lines(lines: &mut Vec<String>, language: &str, revisions: &[Revision]) {
+    if !revisions.is_empty() {
         lines.push(html_bold("Last edits:"));
-        for revision in &metadata.revisions {
-            let comment = revision
-                .comment
-                .as_deref()
-                .map(str::trim)
-                .filter(|comment| !comment.is_empty())
-                .unwrap_or("(no edit summary)");
-            let tags = revision
-                .tags
-                .as_ref()
-                .filter(|tags| !tags.is_empty())
-                .map(|tags| format!(" [{}]", html_escape_text(&tags.join(", "))))
-                .unwrap_or_default();
-            let revision = revision.clone();
-            let revision_text = revision
-                .revid
-                .map(|revid| revision_link(&metadata.language, revid))
-                .unwrap_or_else(|| "rev 0".to_string());
-            lines.push(format!(
-                "- {} | {} | {} | size {} | {}{}",
-                html_escape_text(revision.timestamp.as_deref().unwrap_or("unknown time")),
-                revision_user_link(&metadata.language, revision.user.as_deref()),
-                revision_text,
-                revision
-                    .size
-                    .map(|size| size.to_string())
-                    .unwrap_or_else(|| "?".to_string()),
-                html_escape_text(&truncate_for_telegram(comment, 240)),
-                tags
-            ));
+        for revision in revisions {
+            lines.push(article_revision_line(language, revision));
         }
     }
+}
 
-    lines.join("\n")
+/// Formats one article revision row.
+fn article_revision_line(language: &str, revision: &Revision) -> String {
+    let comment = revision
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|comment| !comment.is_empty())
+        .unwrap_or("(no edit summary)");
+    let tags = revision_tags_suffix(revision);
+    let revision_text = revision
+        .revid
+        .map(|revid| revision_link(language, revid))
+        .unwrap_or_else(|| "rev 0".to_string());
+    format!(
+        "- {} | {} | {} | size {} | {}{}",
+        html_escape_text(revision.timestamp.as_deref().unwrap_or("unknown time")),
+        revision_user_link(language, revision.user.as_deref()),
+        revision_text,
+        revision
+            .size
+            .map(|size| size.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        html_escape_text(&truncate_for_telegram(comment, 240)),
+        tags
+    )
+}
+
+/// Formats revision tags when Wikimedia returns any.
+fn revision_tags_suffix(revision: &Revision) -> String {
+    revision
+        .tags
+        .as_ref()
+        .filter(|tags| !tags.is_empty())
+        .map(|tags| format!(" [{}]", html_escape_text(&tags.join(", "))))
+        .unwrap_or_default()
 }
 
 /// Renders Wikidata claims into Telegram-sized HTML messages.
@@ -5959,11 +6184,7 @@ fn render_wikidata_snak_value(
     property_formatters: &HashMap<String, String>,
 ) -> Option<String> {
     let Some(datavalue) = &snak.datavalue else {
-        return match snak.snaktype.as_deref() {
-            Some("somevalue") => Some(html_escape_text("some value")),
-            Some("novalue") => Some(html_escape_text("no value")),
-            _ => None,
-        };
+        return render_wikidata_missing_snak_value(snak);
     };
 
     if let Some(entity_id) = wikidata_entity_id_from_value(&datavalue.value) {
@@ -5971,41 +6192,69 @@ fn render_wikidata_snak_value(
     }
 
     if let Some(value) = datavalue.value.as_str() {
-        if snak.datatype.as_deref() == Some("external-id")
-            && let Some(formatter) = property_formatters.get(property_id)
-            && let Some(url) = wikidata_external_id_url(formatter, value)
-        {
-            return Some(html_link(&url, value));
-        }
-        if snak.datatype.as_deref() == Some("commonsMedia") {
-            return Some(html_link(&commons_file_url(value), value));
-        }
-        return if is_absolute_url(value) {
-            Some(html_link(value, value))
-        } else {
-            Some(html_escape_text(value))
-        };
+        return Some(render_wikidata_string_value(
+            property_id,
+            snak.datatype.as_deref(),
+            value,
+            property_formatters,
+        ));
     }
 
-    if let Some(value) = datavalue.value.as_object() {
-        if let Some(rendered) = wikidata_coordinate_value(value) {
-            return Some(rendered);
-        }
-        if let Some(rendered) = wikidata_time_value(value) {
-            return Some(rendered);
-        }
-        if let Some(rendered) = wikidata_quantity_value(value, labels) {
-            return Some(rendered);
-        }
-        if let Some(rendered) = wikidata_monolingual_text_value(value) {
-            return Some(rendered);
-        }
+    if let Some(value) = datavalue.value.as_object()
+        && let Some(rendered) = render_wikidata_object_value(value, labels)
+    {
+        return Some(rendered);
     }
 
-    Some(html_escape_text(&truncate_for_telegram(
-        &datavalue.value.to_string(),
-        240,
-    )))
+    Some(render_unknown_wikidata_value(&datavalue.value))
+}
+
+/// Renders Wikidata snaks without a concrete datavalue.
+fn render_wikidata_missing_snak_value(snak: &WikidataSnak) -> Option<String> {
+    match snak.snaktype.as_deref() {
+        Some("somevalue") => Some(html_escape_text("some value")),
+        Some("novalue") => Some(html_escape_text("no value")),
+        _ => None,
+    }
+}
+
+/// Renders string-shaped Wikidata values.
+fn render_wikidata_string_value(
+    property_id: &str,
+    datatype: Option<&str>,
+    value: &str,
+    property_formatters: &HashMap<String, String>,
+) -> String {
+    if datatype == Some("external-id")
+        && let Some(formatter) = property_formatters.get(property_id)
+        && let Some(url) = wikidata_external_id_url(formatter, value)
+    {
+        return html_link(&url, value);
+    }
+    if datatype == Some("commonsMedia") {
+        return html_link(&commons_file_url(value), value);
+    }
+    if is_absolute_url(value) {
+        html_link(value, value)
+    } else {
+        html_escape_text(value)
+    }
+}
+
+/// Renders object-shaped Wikidata values.
+fn render_wikidata_object_value(
+    value: &serde_json::Map<String, Value>,
+    labels: &HashMap<String, WikidataLabelInfo>,
+) -> Option<String> {
+    wikidata_coordinate_value(value)
+        .or_else(|| wikidata_time_value(value))
+        .or_else(|| wikidata_quantity_value(value, labels))
+        .or_else(|| wikidata_monolingual_text_value(value))
+}
+
+/// Renders any Wikidata value shape the bot does not understand yet.
+fn render_unknown_wikidata_value(value: &Value) -> String {
+    html_escape_text(&truncate_for_telegram(&value.to_string(), 240))
 }
 
 /// Formats a Wikidata globe-coordinate value as a clickable map link.
