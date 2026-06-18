@@ -36,6 +36,7 @@ const ARTICLE_BODY_LINK_LIMIT: usize = 20;
 const ARTICLE_TITLE_LOOKUP_LIMIT: usize = 50;
 const MEDIA_FILE_LOOKUP_LIMIT: usize = 50;
 const ARTICLE_IMAGE_GALLERY_LIMIT: usize = 10;
+const ARTICLE_IMAGE_FALLBACK_THUMB_WIDTH: usize = 3840;
 const MIN_ICON_FILTER_SIDE_PX: u64 = 160;
 const INLINE_MESSAGE_CHAR_LIMIT: usize = 3900;
 const INLINE_CACHE_TIME_SECONDS: u32 = 0;
@@ -808,10 +809,26 @@ impl App {
         let mut metadata_task: Option<JoinHandle<Result<ArticleMetadata>>> = None;
         let mut media_task: Option<JoinHandle<Result<ArticleMedia>>> = None;
 
-        let parts = render_article_html_parts(&language, &article, self.config.message_char_limit);
-        for (index, part) in parts.iter().enumerate() {
-            self.send_html_message(chat_id, part, None).await?;
-            if index == 0 {
+        let parts =
+            render_article_output_parts(&language, &article, self.config.message_char_limit);
+        let mut started_followups = false;
+        let mut inline_images = Vec::new();
+        for part in parts {
+            match part {
+                ArticleOutputPart::Html(html) => {
+                    self.send_html_message(chat_id, &html, None).await?;
+                }
+                ArticleOutputPart::Images(images) => {
+                    if !self.config.article_images_button_only && !images.is_empty() {
+                        self.send_image_gallery(chat_id, &images).await?;
+                        inline_images.extend(images);
+                    }
+                    continue;
+                }
+            }
+
+            if !started_followups {
+                started_followups = true;
                 categories_task = Some(spawn_wiki_task({
                     let wiki = self.wiki.clone();
                     let language = language.clone();
@@ -977,11 +994,14 @@ impl App {
                 Ok(media) => {
                     self.send_media(
                         chat_id,
-                        &language,
-                        page_id,
-                        &article.title,
-                        &media,
-                        article.infobox_image.as_ref(),
+                        ArticleMediaSend {
+                            language: &language,
+                            page_id,
+                            title: &article.title,
+                            media: &media,
+                            infobox_image: article.infobox_image.as_ref(),
+                            excluded_images: &inline_images,
+                        },
                     )
                     .await?
                 }
@@ -1078,26 +1098,23 @@ impl App {
         Ok(())
     }
 
-    async fn send_media(
-        &self,
-        chat_id: i64,
-        language: &str,
-        page_id: u64,
-        title: &str,
-        media: &ArticleMedia,
-        infobox_image: Option<&MediaItem>,
-    ) -> Result<()> {
-        let images = article_gallery_images(media, infobox_image);
+    async fn send_media(&self, chat_id: i64, context: ArticleMediaSend<'_>) -> Result<()> {
+        let images = filter_excluded_media_items(
+            article_gallery_images(context.media, context.infobox_image),
+            context.excluded_images,
+        );
         if self.config.article_images_button_only {
-            if let Some(keyboard) = article_images_keyboard(language, page_id, images.len()) {
+            if let Some(keyboard) =
+                article_images_keyboard(context.language, context.page_id, images.len())
+            {
                 self.send_html_message(chat_id, &html_bold("Article images"), Some(keyboard))
                     .await?;
             }
         } else if !images.is_empty() {
-            self.send_image_gallery(chat_id, title, &images).await?;
+            self.send_image_gallery(chat_id, &images).await?;
         }
 
-        if let Some(audio) = &media.audio {
+        if let Some(audio) = &context.media.audio {
             self.send_chat_action(chat_id, "upload_voice").await?;
             if let Err(err) = self
                 .telegram_post(
@@ -1107,7 +1124,7 @@ impl App {
                         "audio": audio.url,
                         "title": truncate_for_telegram(&audio.title, 64),
                         "caption": truncate_for_telegram(
-                            &format!("Audio from {title}"),
+                            &format!("Audio from {}", context.title),
                             1024
                         )
                     }),
@@ -1141,16 +1158,10 @@ impl App {
             return Ok(());
         }
 
-        self.send_image_gallery(chat_id, &article.title, &images)
-            .await
+        self.send_image_gallery(chat_id, &images).await
     }
 
-    async fn send_image_gallery(
-        &self,
-        chat_id: i64,
-        title: &str,
-        images: &[MediaItem],
-    ) -> Result<()> {
+    async fn send_image_gallery(&self, chat_id: i64, images: &[MediaItem]) -> Result<()> {
         let images = images
             .iter()
             .take(ARTICLE_IMAGE_GALLERY_LIMIT)
@@ -1160,21 +1171,28 @@ impl App {
         }
 
         self.send_chat_action(chat_id, "upload_photo").await?;
-        let caption = format!("Images for {title}");
         if images.len() == 1 {
-            return self.send_media_item(chat_id, &caption, images[0]).await;
+            if !self.send_media_item(chat_id, images[0]).await? {
+                self.send_message(
+                    chat_id,
+                    "Article image found, but Telegram could not fetch it.",
+                    None,
+                )
+                .await?;
+            }
+            return Ok(());
         }
 
         let media = images
             .iter()
-            .enumerate()
-            .map(|(index, image)| {
+            .map(|image| {
                 let mut item = json!({
                     "type": "photo",
                     "media": image.url,
                 });
-                if index == 0 {
-                    item["caption"] = Value::String(truncate_for_telegram(&caption, 1024));
+                if let Some(caption) = image.caption.as_ref() {
+                    item["caption"] = Value::String(caption_html_for_telegram(caption));
+                    item["parse_mode"] = Value::String("HTML".to_string());
                 }
                 item
             })
@@ -1191,28 +1209,89 @@ impl App {
             .await
         {
             warn!(error = %err, "failed to send article image gallery");
+            self.send_image_gallery_individually(chat_id, &images)
+                .await?;
         }
 
         Ok(())
     }
 
-    async fn send_media_item(&self, chat_id: i64, caption: &str, image: &MediaItem) -> Result<()> {
-        self.send_chat_action(chat_id, "upload_photo").await?;
-        if let Err(err) = self
-            .telegram_post(
-                "sendPhoto",
-                &json!({
-                    "chat_id": chat_id,
-                    "photo": image.url,
-                    "caption": truncate_for_telegram(caption, 1024)
-                }),
+    async fn send_image_gallery_individually(
+        &self,
+        chat_id: i64,
+        images: &[&MediaItem],
+    ) -> Result<()> {
+        let mut sent = 0usize;
+        for image in images {
+            if self.send_media_item(chat_id, image).await? {
+                sent += 1;
+            }
+        }
+
+        if sent == 0 {
+            self.send_message(
+                chat_id,
+                "Article images found, but Telegram could not fetch them.",
+                None,
             )
-            .await
-        {
-            warn!(error = %err, "failed to send article image");
+            .await?;
         }
 
         Ok(())
+    }
+
+    async fn send_media_item(&self, chat_id: i64, image: &MediaItem) -> Result<bool> {
+        self.send_chat_action(chat_id, "upload_photo").await?;
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "photo": image.url,
+        });
+        add_media_caption_payload(&mut payload, image);
+
+        if let Err(original_err) = self.telegram_post("sendPhoto", &payload).await {
+            let mut document_payload = json!({
+                "chat_id": chat_id,
+                "document": image.url,
+            });
+            add_media_caption_payload(&mut document_payload, image);
+            if self
+                .telegram_post("sendDocument", &document_payload)
+                .await
+                .is_ok()
+            {
+                warn!(
+                    error = %original_err,
+                    title = %image.title,
+                    url = %image.url,
+                    "sent original image as document after photo send failed"
+                );
+                return Ok(true);
+            }
+
+            if let Some(fallback_url) = image.fallback_url.as_ref() {
+                payload["photo"] = Value::String(fallback_url.clone());
+                if self.telegram_post("sendPhoto", &payload).await.is_ok() {
+                    warn!(
+                        error = %original_err,
+                        title = %image.title,
+                        url = %image.url,
+                        fallback_url,
+                        "sent fallback thumbnail after original image failed"
+                    );
+                    return Ok(true);
+                }
+            }
+
+            warn!(
+                error = %original_err,
+                title = %image.title,
+                url = %image.url,
+                "failed to send article image"
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     async fn send_message(
@@ -2506,7 +2585,10 @@ impl WikiClient {
             ("prop", "pageimages|images".to_string()),
             ("pageids", page_id.to_string()),
             ("piprop", "thumbnail|original|name".to_string()),
-            ("pithumbsize", "1280".to_string()),
+            (
+                "pithumbsize",
+                ARTICLE_IMAGE_FALLBACK_THUMB_WIDTH.to_string(),
+            ),
             ("pilicense", "any".to_string()),
             ("imlimit", MEDIA_FILE_LOOKUP_LIMIT.to_string()),
             ("redirects", "1".to_string()),
@@ -2536,6 +2618,8 @@ impl WikiClient {
                     .clone()
                     .unwrap_or_else(|| "Lead image".to_string()),
                 url: thumbnail.source,
+                fallback_url: None,
+                caption: None,
                 mime: None,
                 width: thumbnail.width,
                 height: thumbnail.height,
@@ -2604,6 +2688,7 @@ impl WikiClient {
             ("prop", "imageinfo".to_string()),
             ("titles", titles.join("|")),
             ("iiprop", "url|mime|size|mediatype".to_string()),
+            ("iiurlwidth", ARTICLE_IMAGE_FALLBACK_THUMB_WIDTH.to_string()),
         ];
 
         let response: ImageInfoResponse = self
@@ -2620,16 +2705,7 @@ impl WikiClient {
             .query
             .pages
             .into_iter()
-            .filter_map(|page| {
-                let info = page.imageinfo?.into_iter().next()?;
-                Some(MediaItem {
-                    title: page.title,
-                    url: info.url,
-                    mime: info.mime,
-                    width: info.width,
-                    height: info.height,
-                })
-            })
+            .filter_map(media_item_from_image_info_page)
             .collect())
     }
 
@@ -3783,11 +3859,32 @@ fn article_url(language: &str, title: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn render_article_html_parts(
     language: &str,
     article: &ArticleContent,
     limit: usize,
 ) -> Vec<String> {
+    render_article_output_parts(language, article, limit)
+        .into_iter()
+        .filter_map(|part| match part {
+            ArticleOutputPart::Html(html) => Some(html),
+            ArticleOutputPart::Images(_) => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArticleOutputPart {
+    Html(String),
+    Images(Vec<MediaItem>),
+}
+
+fn render_article_output_parts(
+    language: &str,
+    article: &ArticleContent,
+    limit: usize,
+) -> Vec<ArticleOutputPart> {
     let mut intro_sections = Vec::new();
     intro_sections.push(html_bold_link(
         &article_url(language, &article.title),
@@ -3800,7 +3897,10 @@ fn render_article_html_parts(
             html_bold("Disambiguation page"),
             html_escape_text("Choose a target article from the buttons below.")
         ));
-        return combine_html_sections(intro_sections, limit);
+        return combine_html_sections(intro_sections, limit)
+            .into_iter()
+            .map(ArticleOutputPart::Html)
+            .collect();
     }
 
     if let Some(infobox) = &article.infobox {
@@ -3811,23 +3911,29 @@ fn render_article_html_parts(
         ));
     }
 
-    let body_parts = if !article.body_sections.is_empty() {
-        render_article_body_section_parts(language, &article.title, &article.body_sections, limit)
+    let mut parts = combine_html_sections(intro_sections, limit)
+        .into_iter()
+        .map(ArticleOutputPart::Html)
+        .collect::<Vec<_>>();
+    if let Some(image) = article.infobox_image.as_ref() {
+        parts.push(ArticleOutputPart::Images(vec![image.clone()]));
+    }
+
+    let fallback_sections;
+    let body_sections = if !article.body_sections.is_empty() {
+        article.body_sections.as_slice()
     } else if let Some(body_html) = article
         .body_html
         .as_deref()
         .map(str::trim)
         .filter(|body| !body.is_empty())
     {
-        render_article_body_section_parts(
-            language,
-            &article.title,
-            &[ArticleBodySection {
-                heading: None,
-                html: body_html.to_string(),
-            }],
-            limit,
-        )
+        fallback_sections = vec![ArticleBodySection {
+            heading: None,
+            html: body_html.to_string(),
+            images: Vec::new(),
+        }];
+        fallback_sections.as_slice()
     } else {
         let extract = article.extract.trim();
         let extract = if extract.is_empty() {
@@ -3835,18 +3941,30 @@ fn render_article_html_parts(
         } else {
             extract
         };
-        render_article_body_section_parts(
-            language,
-            &article.title,
-            &[ArticleBodySection {
-                heading: None,
-                html: html_escape_text(extract),
-            }],
-            limit,
-        )
+        fallback_sections = vec![ArticleBodySection {
+            heading: None,
+            html: html_escape_text(extract),
+            images: Vec::new(),
+        }];
+        fallback_sections.as_slice()
     };
-    let mut parts = combine_html_sections(intro_sections, limit);
-    parts.extend(body_parts);
+
+    for section in body_sections {
+        parts.extend(
+            render_article_body_section_parts(
+                language,
+                &article.title,
+                std::slice::from_ref(section),
+                limit,
+            )
+            .into_iter()
+            .map(ArticleOutputPart::Html),
+        );
+        if !section.images.is_empty() {
+            parts.push(ArticleOutputPart::Images(section.images.clone()));
+        }
+    }
+
     parts
 }
 
@@ -4126,6 +4244,21 @@ fn html_escape_text(value: &str) -> String {
     html_escape::encode_text(value).to_string()
 }
 
+fn caption_html_for_telegram(caption: &str) -> String {
+    if caption.chars().count() <= 1024 {
+        caption.to_string()
+    } else {
+        html_escape_text(&truncate_for_telegram(&html_to_plain_text(caption), 1024))
+    }
+}
+
+fn add_media_caption_payload(payload: &mut Value, image: &MediaItem) {
+    if let Some(caption) = image.caption.as_ref() {
+        payload["caption"] = Value::String(caption_html_for_telegram(caption));
+        payload["parse_mode"] = Value::String("HTML".to_string());
+    }
+}
+
 #[cfg(test)]
 fn mediawiki_html_to_telegram_html(language: &str, title: &str, html: &str) -> Option<String> {
     article_body_sections_to_html(
@@ -4147,7 +4280,9 @@ fn article_body_sections_to_html(
             if let Some(heading) = &section.heading {
                 blocks.push(article_body_heading_html(language, title, heading));
             }
-            blocks.push(section.html.clone());
+            if !section.html.trim().is_empty() {
+                blocks.push(section.html.clone());
+            }
             blocks
         })
         .collect::<Vec<_>>();
@@ -4188,6 +4323,7 @@ struct ArticleBodySectionBuilder {
     sections: Vec<ArticleBodySection>,
     current_heading: Option<ArticleBodyHeading>,
     current_blocks: Vec<String>,
+    current_images: Vec<MediaItem>,
 }
 
 impl ArticleBodySectionBuilder {
@@ -4196,11 +4332,16 @@ impl ArticleBodySectionBuilder {
             sections: Vec::new(),
             current_heading: None,
             current_blocks: Vec::new(),
+            current_images: Vec::new(),
         }
     }
 
     fn push_block(&mut self, block: String) {
         self.current_blocks.push(block);
+    }
+
+    fn push_image(&mut self, image: MediaItem) {
+        push_unique_media_item(&mut self.current_images, image);
     }
 
     fn start_section(&mut self, heading: ArticleBodyHeading) {
@@ -4214,13 +4355,14 @@ impl ArticleBodySectionBuilder {
     }
 
     fn flush(&mut self) {
-        if self.current_blocks.is_empty() {
+        if self.current_blocks.is_empty() && self.current_images.is_empty() {
             return;
         }
 
         self.sections.push(ArticleBodySection {
             heading: self.current_heading.take(),
             html: self.current_blocks.join("\n\n"),
+            images: std::mem::take(&mut self.current_images),
         });
         self.current_blocks.clear();
     }
@@ -4590,6 +4732,18 @@ fn collect_html_blocks(
     element: ElementRef<'_>,
     sections: &mut ArticleBodySectionBuilder,
 ) {
+    if element.value().name() == "img" {
+        if let Some(image) = media_item_from_html_image(language, element) {
+            sections.push_image(image);
+        }
+        return;
+    }
+
+    if element.value().name() == "figure" {
+        collect_html_images(language, element, sections);
+        return;
+    }
+
     if should_skip_block(element) {
         return;
     }
@@ -4644,6 +4798,87 @@ fn collect_html_blocks(
             }
         }
     }
+}
+
+fn collect_html_images(
+    language: &str,
+    element: ElementRef<'_>,
+    sections: &mut ArticleBodySectionBuilder,
+) {
+    let image_selector = Selector::parse("img[src]").expect("image selector is valid");
+    for image in element.select(&image_selector) {
+        if let Some(image) = media_item_from_html_image(language, image) {
+            sections.push_image(image);
+        }
+    }
+}
+
+fn media_item_from_html_image(language: &str, image: ElementRef<'_>) -> Option<MediaItem> {
+    if element_or_ancestor_has_class_part(
+        image,
+        &[
+            "infobox",
+            "navbox",
+            "metadata",
+            "reflist",
+            "reference",
+            "gallery",
+            "mw-kartographer",
+            "locmap",
+        ],
+    ) {
+        return None;
+    }
+
+    let alt = image.value().attr("alt").unwrap_or_default().trim();
+    if alt.eq_ignore_ascii_case("map") {
+        return None;
+    }
+
+    let src = image.value().attr("src").and_then(normalize_image_src)?;
+    if !looks_like_image_url(&src) {
+        return None;
+    }
+    let original = wikimedia_original_image_url_from_thumbnail(&src).unwrap_or_else(|| src.clone());
+    let fallback_url = (original != src)
+        .then(|| wikimedia_thumbnail_url_with_width(&src, ARTICLE_IMAGE_FALLBACK_THUMB_WIDTH))
+        .flatten()
+        .or_else(|| (original != src).then_some(src));
+
+    let title = image
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .find(|element| element.value().name() == "a")
+        .and_then(|link| link.value().attr("title"))
+        .or_else(|| (!alt.is_empty()).then_some(alt))
+        .unwrap_or("Article image")
+        .to_string();
+    let item = MediaItem {
+        title,
+        url: original,
+        fallback_url,
+        caption: image_caption_from_ancestor(language, image),
+        mime: None,
+        width: image.value().attr("width").and_then(parse_u64_attr),
+        height: image.value().attr("height").and_then(parse_u64_attr),
+    };
+
+    is_gallery_image(&item).then_some(item)
+}
+
+fn parse_u64_attr(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+fn image_caption_from_ancestor(language: &str, image: ElementRef<'_>) -> Option<String> {
+    let caption_selector = Selector::parse("figcaption").expect("figcaption selector is valid");
+    image
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .find(|element| element.value().name() == "figure")
+        .and_then(|figure| figure.select(&caption_selector).next())
+        .map(|caption| trim_html_spacing(&render_inline_element(language, caption)))
+        .filter(|caption| !caption.is_empty())
 }
 
 fn element_anchor_id(element: ElementRef<'_>) -> Option<String> {
@@ -6150,6 +6385,14 @@ fn extract_infobox_image(html: &str) -> Option<MediaItem> {
             if !looks_like_image_url(&src) {
                 continue;
             }
+            let original =
+                wikimedia_original_image_url_from_thumbnail(&src).unwrap_or_else(|| src.clone());
+            let fallback_url = (original != src)
+                .then(|| {
+                    wikimedia_thumbnail_url_with_width(&src, ARTICLE_IMAGE_FALLBACK_THUMB_WIDTH)
+                })
+                .flatten()
+                .or_else(|| (original != src).then_some(src));
 
             let title = image
                 .ancestors()
@@ -6161,7 +6404,9 @@ fn extract_infobox_image(html: &str) -> Option<MediaItem> {
 
             return Some(MediaItem {
                 title,
-                url: src,
+                url: original,
+                fallback_url,
+                caption: None,
                 mime: None,
                 width: None,
                 height: None,
@@ -6170,6 +6415,27 @@ fn extract_infobox_image(html: &str) -> Option<MediaItem> {
     }
 
     None
+}
+
+fn media_item_from_image_info_page(page: ImageInfoPage) -> Option<MediaItem> {
+    let info = page.imageinfo?.into_iter().next()?;
+    let fallback_url = info
+        .mime
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("image/"))
+        .then(|| info.thumburl.clone())
+        .flatten()
+        .filter(|thumburl| thumburl != &info.url);
+
+    Some(MediaItem {
+        title: page.title,
+        url: info.url,
+        fallback_url,
+        caption: None,
+        mime: info.mime,
+        width: info.width,
+        height: info.height,
+    })
 }
 
 fn normalize_image_src(src: &str) -> Option<String> {
@@ -6182,6 +6448,28 @@ fn normalize_image_src(src: &str) -> Option<String> {
     } else {
         src.strip_prefix("//").map(|rest| format!("https://{rest}"))
     }
+}
+
+fn wikimedia_original_image_url_from_thumbnail(url: &str) -> Option<String> {
+    let (prefix, rest) = url.split_once("/thumb/")?;
+    if !prefix.ends_with("upload.wikimedia.org/wikipedia/commons") {
+        return None;
+    }
+
+    let original_path = rest.rsplit_once('/')?.0;
+    Some(format!("{prefix}/{original_path}"))
+}
+
+fn wikimedia_thumbnail_url_with_width(url: &str, width: usize) -> Option<String> {
+    let (prefix, rest) = url.split_once("/thumb/")?;
+    if !prefix.ends_with("upload.wikimedia.org/wikipedia/commons") {
+        return None;
+    }
+
+    let (original_path, thumbnail_file) = rest.rsplit_once('/')?;
+    let suffix_start = thumbnail_file.find("px-")? + "px-".len();
+    let suffix = thumbnail_file.get(suffix_start..)?;
+    Some(format!("{prefix}/thumb/{original_path}/{width}px-{suffix}"))
 }
 
 fn looks_like_image_url(url: &str) -> bool {
@@ -6358,6 +6646,33 @@ fn article_gallery_images(
     images
 }
 
+fn filter_excluded_media_items(
+    images: Vec<MediaItem>,
+    excluded_images: &[MediaItem],
+) -> Vec<MediaItem> {
+    if excluded_images.is_empty() {
+        return images;
+    }
+
+    let excluded_urls = excluded_images
+        .iter()
+        .map(|image| image.url.as_str())
+        .collect::<HashSet<_>>();
+    let excluded_titles = excluded_images
+        .iter()
+        .map(|image| normalized_media_title(&image.title))
+        .filter(|title| !title.is_empty() && title != "article image" && title != "infobox image")
+        .collect::<HashSet<_>>();
+
+    images
+        .into_iter()
+        .filter(|image| {
+            !excluded_urls.contains(image.url.as_str())
+                && !excluded_titles.contains(&normalized_media_title(&image.title))
+        })
+        .collect()
+}
+
 fn looks_like_icon_media_item(item: &MediaItem) -> bool {
     looks_like_icon_title(&item.title)
         || looks_like_icon_title(&item.url)
@@ -6490,6 +6805,7 @@ struct ArticleContent {
 struct ArticleBodySection {
     heading: Option<ArticleBodyHeading>,
     html: String,
+    images: Vec<MediaItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6657,10 +6973,21 @@ struct ArticleMedia {
     audio: Option<MediaItem>,
 }
 
-#[derive(Debug, Clone)]
+struct ArticleMediaSend<'a> {
+    language: &'a str,
+    page_id: u64,
+    title: &'a str,
+    media: &'a ArticleMedia,
+    infobox_image: Option<&'a MediaItem>,
+    excluded_images: &'a [MediaItem],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MediaItem {
     title: String,
     url: String,
+    fallback_url: Option<String>,
+    caption: Option<String>,
     mime: Option<String>,
     width: Option<u64>,
     height: Option<u64>,
@@ -6846,6 +7173,7 @@ struct ImageInfo {
     mime: Option<String>,
     width: Option<u64>,
     height: Option<u64>,
+    thumburl: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7059,6 +7387,8 @@ mod tests {
         let infobox = MediaItem {
             title: "File:Lead.jpg".to_string(),
             url: "https://upload.wikimedia.org/lead.jpg".to_string(),
+            fallback_url: None,
+            caption: None,
             mime: Some("image/jpeg".to_string()),
             width: Some(1200),
             height: Some(800),
@@ -7066,6 +7396,8 @@ mod tests {
         let lead_duplicate = MediaItem {
             title: "Lead.jpg".to_string(),
             url: "https://upload.wikimedia.org/lead-thumbnail.jpg".to_string(),
+            fallback_url: None,
+            caption: None,
             mime: Some("image/jpeg".to_string()),
             width: Some(640),
             height: Some(480),
@@ -7073,6 +7405,8 @@ mod tests {
         let icon = MediaItem {
             title: "File:OOjs UI icon edit.svg".to_string(),
             url: "https://upload.wikimedia.org/icon.svg".to_string(),
+            fallback_url: None,
+            caption: None,
             mime: Some("image/svg+xml".to_string()),
             width: Some(20),
             height: Some(20),
@@ -7082,6 +7416,8 @@ mod tests {
             images.push(MediaItem {
                 title: format!("File:Photo {index}.jpg"),
                 url: format!("https://upload.wikimedia.org/photo-{index}.jpg"),
+                fallback_url: None,
+                caption: None,
                 mime: Some("image/jpeg".to_string()),
                 width: Some(1000),
                 height: Some(700),
@@ -7105,6 +7441,124 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn article_section_images_are_attached_to_their_section() {
+        let html = r#"
+            <p>Lead body.</p>
+            <h2><span class="mw-headline" id="History">History</span></h2>
+            <figure>
+              <a href="/wiki/File:Batumi.jpg" title="File:Batumi.jpg">
+                <img src="//upload.wikimedia.org/wikipedia/commons/thumb/a/a0/Batumi.jpg/220px-Batumi.jpg" width="220" height="140" alt="Batumi skyline" />
+              </a>
+              <figcaption><a href="/wiki/Port_of_Batumi">Port of Batumi</a> in 1881.</figcaption>
+            </figure>
+            <p>History body.</p>
+        "#;
+
+        let sections = mediawiki_html_to_telegram_sections("en", "Batumi", html);
+
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].images.is_empty());
+        assert_eq!(sections[1].images.len(), 1);
+        assert_eq!(sections[1].images[0].title, "File:Batumi.jpg");
+        assert_eq!(
+            sections[1].images[0].url,
+            "https://upload.wikimedia.org/wikipedia/commons/a/a0/Batumi.jpg"
+        );
+        assert_eq!(
+            sections[1].images[0].fallback_url.as_deref(),
+            Some(
+                "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a0/Batumi.jpg/3840px-Batumi.jpg"
+            )
+        );
+        assert_eq!(
+            sections[1].images[0].caption.as_deref(),
+            Some(
+                "<a href=\"https://en.wikipedia.org/wiki/Port_of_Batumi\">Port of Batumi</a> in 1881."
+            )
+        );
+    }
+
+    #[test]
+    fn image_info_media_items_use_original_with_thumbnail_fallback() {
+        let item = media_item_from_image_info_page(ImageInfoPage {
+            title: "File:Large image.tif".to_string(),
+            imageinfo: Some(vec![ImageInfo {
+                url: "https://upload.wikimedia.org/original.tif".to_string(),
+                mime: Some("image/tiff".to_string()),
+                width: Some(4000),
+                height: Some(3000),
+                thumburl: Some("https://upload.wikimedia.org/thumb.jpg".to_string()),
+            }]),
+        })
+        .unwrap();
+
+        assert_eq!(item.url, "https://upload.wikimedia.org/original.tif");
+        assert_eq!(
+            item.fallback_url.as_deref(),
+            Some("https://upload.wikimedia.org/thumb.jpg")
+        );
+        assert_eq!(item.width, Some(4000));
+        assert_eq!(item.height, Some(3000));
+    }
+
+    #[test]
+    fn wikimedia_thumbnail_urls_can_be_rewritten_to_larger_widths() {
+        let thumb = "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b9/1071_-_Kaukasus_2014_-_Georgien_-_Batumi_%2816728246174%29.jpg/250px-1071_-_Kaukasus_2014_-_Georgien_-_Batumi_%2816728246174%29.jpg";
+
+        assert_eq!(
+            wikimedia_original_image_url_from_thumbnail(thumb).as_deref(),
+            Some(
+                "https://upload.wikimedia.org/wikipedia/commons/b/b9/1071_-_Kaukasus_2014_-_Georgien_-_Batumi_%2816728246174%29.jpg"
+            )
+        );
+        assert_eq!(
+            wikimedia_thumbnail_url_with_width(thumb, ARTICLE_IMAGE_FALLBACK_THUMB_WIDTH)
+                .as_deref(),
+            Some(
+                "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b9/1071_-_Kaukasus_2014_-_Georgien_-_Batumi_%2816728246174%29.jpg/3840px-1071_-_Kaukasus_2014_-_Georgien_-_Batumi_%2816728246174%29.jpg"
+            )
+        );
+    }
+
+    #[test]
+    fn article_gallery_filters_images_already_sent_inline() {
+        let images = vec![
+            MediaItem {
+                title: "File:Batumi.jpg".to_string(),
+                url: "https://upload.wikimedia.org/original.jpg".to_string(),
+                fallback_url: None,
+                caption: None,
+                mime: Some("image/jpeg".to_string()),
+                width: Some(1200),
+                height: Some(800),
+            },
+            MediaItem {
+                title: "File:Other.jpg".to_string(),
+                url: "https://upload.wikimedia.org/other.jpg".to_string(),
+                fallback_url: None,
+                caption: None,
+                mime: Some("image/jpeg".to_string()),
+                width: Some(1200),
+                height: Some(800),
+            },
+        ];
+        let excluded = vec![MediaItem {
+            title: "File:Batumi.jpg".to_string(),
+            url: "https://upload.wikimedia.org/thumb.jpg".to_string(),
+            fallback_url: None,
+            caption: None,
+            mime: None,
+            width: Some(220),
+            height: Some(140),
+        }];
+
+        let filtered = filter_excluded_media_items(images, &excluded);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].title, "File:Other.jpg");
     }
 
     #[test]
@@ -7540,7 +7994,13 @@ mod tests {
         assert_eq!(image.title, "File:Flag.svg");
         assert_eq!(
             image.url,
-            "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a1/Flag.svg/320px-Flag.svg.png"
+            "https://upload.wikimedia.org/wikipedia/commons/a/a1/Flag.svg"
+        );
+        assert_eq!(
+            image.fallback_url.as_deref(),
+            Some(
+                "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a1/Flag.svg/3840px-Flag.svg.png"
+            )
         );
     }
 
@@ -7618,6 +8078,7 @@ mod tests {
                 ArticleBodySection {
                     heading: None,
                     html: "Lead body.".to_string(),
+                    images: Vec::new(),
                 },
                 ArticleBodySection {
                     heading: Some(ArticleBodyHeading {
@@ -7625,6 +8086,7 @@ mod tests {
                         anchor: Some("History".to_string()),
                     }),
                     html: "History body.".to_string(),
+                    images: Vec::new(),
                 },
             ],
             references_html: None,
@@ -7884,7 +8346,13 @@ mod tests {
         assert_eq!(image.title, "File:Mill Farm Inn.jpg");
         assert_eq!(
             image.url,
-            "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0a/Mill_Farm_Inn.jpg/320px-Mill_Farm_Inn.jpg"
+            "https://upload.wikimedia.org/wikipedia/commons/0/0a/Mill_Farm_Inn.jpg"
+        );
+        assert_eq!(
+            image.fallback_url.as_deref(),
+            Some(
+                "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0a/Mill_Farm_Inn.jpg/3840px-Mill_Farm_Inn.jpg"
+            )
         );
     }
 
@@ -7948,7 +8416,13 @@ mod tests {
         assert_eq!(image.title, "File:Flag of Adjara.svg");
         assert_eq!(
             image.url,
-            "https://upload.wikimedia.org/wikipedia/commons/thumb/7/71/Flag_of_Adjara.svg/320px-Flag_of_Adjara.svg.png"
+            "https://upload.wikimedia.org/wikipedia/commons/7/71/Flag_of_Adjara.svg"
+        );
+        assert_eq!(
+            image.fallback_url.as_deref(),
+            Some(
+                "https://upload.wikimedia.org/wikipedia/commons/thumb/7/71/Flag_of_Adjara.svg/3840px-Flag_of_Adjara.svg.png"
+            )
         );
 
         let templates = mediawiki_nav_templates("en", FLAG_OF_ADJARA_HTML);
