@@ -1810,7 +1810,8 @@ impl WikiClient {
             .title
             .clone()
             .unwrap_or_else(|| format!("Page {page_id}"));
-        let body_html = mediawiki_html_to_telegram_html(language, &title, &html);
+        let body_sections = mediawiki_html_to_telegram_sections(language, &title, &html);
+        let body_html = article_body_sections_to_html(language, &title, &body_sections);
         let extract = body_html
             .as_deref()
             .map(html_to_plain_text)
@@ -1835,6 +1836,7 @@ impl WikiClient {
             infobox: extract_infobox_text(language, &html),
             infobox_image: extract_infobox_image(&html),
             body_html,
+            body_sections,
             references_html: mediawiki_references_to_telegram_html(language, &html),
             body_links,
             nav_templates: mediawiki_nav_templates(language, &html),
@@ -3783,36 +3785,46 @@ fn render_article_html_parts(
     article: &ArticleContent,
     limit: usize,
 ) -> Vec<String> {
-    let mut sections = Vec::new();
-    sections.push(html_bold_link(
+    let mut intro_sections = Vec::new();
+    intro_sections.push(html_bold_link(
         &article_url(language, &article.title),
         &article.title,
     ));
 
     if article.is_disambiguation {
-        sections.push(format!(
+        intro_sections.push(format!(
             "{}\n{}",
             html_bold("Disambiguation page"),
             html_escape_text("Choose a target article from the buttons below.")
         ));
-        return combine_html_sections(sections, limit);
+        return combine_html_sections(intro_sections, limit);
     }
 
     if let Some(infobox) = &article.infobox {
-        sections.push(format!(
+        intro_sections.push(format!(
             "{}\n{}",
             html_bold("Infobox"),
             render_infobox_html(infobox, article_infobox_limit(article.length))
         ));
     }
 
-    let body_parts = if let Some(body_html) = article
+    let body_parts = if !article.body_sections.is_empty() {
+        render_article_body_section_parts(language, &article.title, &article.body_sections, limit)
+    } else if let Some(body_html) = article
         .body_html
         .as_deref()
         .map(str::trim)
         .filter(|body| !body.is_empty())
     {
-        split_html_lines_for_telegram(body_html, limit.saturating_sub(512).max(1))
+        render_article_body_section_parts(
+            language,
+            &article.title,
+            &[ArticleBodySection {
+                heading: None,
+                html: body_html.to_string(),
+            }],
+            limit,
+        )
     } else {
         let extract = article.extract.trim();
         let extract = if extract.is_empty() {
@@ -3820,16 +3832,79 @@ fn render_article_html_parts(
         } else {
             extract
         };
-        split_telegram_text(extract, limit.saturating_sub(512).max(1))
-            .into_iter()
-            .map(|part| html_escape_text(&part))
-            .collect::<Vec<_>>()
+        render_article_body_section_parts(
+            language,
+            &article.title,
+            &[ArticleBodySection {
+                heading: None,
+                html: html_escape_text(extract),
+            }],
+            limit,
+        )
     };
-    for part in body_parts {
-        sections.push(part);
+    let mut parts = combine_html_sections(intro_sections, limit);
+    parts.extend(body_parts);
+    parts
+}
+
+fn render_article_body_section_parts(
+    language: &str,
+    article_title: &str,
+    sections: &[ArticleBodySection],
+    limit: usize,
+) -> Vec<String> {
+    let limit = limit.max(1);
+    let mut parts = Vec::new();
+
+    for section in sections {
+        let section_html = section.html.trim();
+        if section_html.is_empty() {
+            continue;
+        }
+
+        let prefix = render_article_body_section_prefix(language, article_title, section);
+        let prefix_len = prefix.chars().count();
+        let chunk_limit = limit.saturating_sub(prefix_len + 2).max(1);
+
+        for chunk in split_html_lines_for_telegram(section_html, chunk_limit) {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                parts.push(prefix.clone());
+            } else {
+                parts.push(format!("{prefix}\n\n{chunk}"));
+            }
+        }
     }
 
-    combine_html_sections(sections, limit)
+    parts
+}
+
+fn render_article_body_section_prefix(
+    language: &str,
+    article_title: &str,
+    section: &ArticleBodySection,
+) -> String {
+    let article_url = article_url(language, article_title);
+    let article = html_link(&article_url, article_title);
+    let (section_title, section_url) = match section.heading.as_ref() {
+        Some(heading) => (
+            heading.title.as_str(),
+            article_body_section_url(language, article_title, heading.anchor.as_deref()),
+        ),
+        None => ("Lead", article_url),
+    };
+    format!(
+        "{}: {}",
+        article,
+        html_italic_link(&section_url, section_title)
+    )
+}
+
+fn article_body_section_url(language: &str, article_title: &str, anchor: Option<&str>) -> String {
+    let url = article_url(language, article_title);
+    anchor
+        .map(|anchor| format!("{url}#{anchor}"))
+        .unwrap_or(url)
 }
 
 fn render_categories_html(language: &str, categories: &[Category]) -> String {
@@ -4037,16 +4112,116 @@ fn html_bold_link(url: &str, text: &str) -> String {
     )
 }
 
+fn html_italic_link(url: &str, text: &str) -> String {
+    format!(
+        "<i><a href=\"{}\">{}</a></i>",
+        html_escape::encode_double_quoted_attribute(url),
+        html_escape_text(text)
+    )
+}
+
 fn html_escape_text(value: &str) -> String {
     html_escape::encode_text(value).to_string()
 }
 
+#[cfg(test)]
 fn mediawiki_html_to_telegram_html(language: &str, title: &str, html: &str) -> Option<String> {
+    article_body_sections_to_html(
+        language,
+        title,
+        &mediawiki_html_to_telegram_sections(language, title, html),
+    )
+}
+
+fn article_body_sections_to_html(
+    language: &str,
+    title: &str,
+    sections: &[ArticleBodySection],
+) -> Option<String> {
+    let blocks = sections
+        .iter()
+        .flat_map(|section| {
+            let mut blocks = Vec::new();
+            if let Some(heading) = &section.heading {
+                blocks.push(article_body_heading_html(language, title, heading));
+            }
+            blocks.push(section.html.clone());
+            blocks
+        })
+        .collect::<Vec<_>>();
+
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+}
+
+fn article_body_heading_html(
+    language: &str,
+    article_title: &str,
+    heading: &ArticleBodyHeading,
+) -> String {
+    heading
+        .anchor
+        .as_deref()
+        .map(|anchor| {
+            html_bold_link(
+                &article_body_section_url(language, article_title, Some(anchor)),
+                &heading.title,
+            )
+        })
+        .unwrap_or_else(|| html_bold(&heading.title))
+}
+
+fn mediawiki_html_to_telegram_sections(
+    language: &str,
+    _title: &str,
+    html: &str,
+) -> Vec<ArticleBodySection> {
     let document = Html::parse_fragment(html);
     let root = document.root_element();
-    let mut sections = Vec::new();
-    collect_html_blocks(language, title, root, &mut sections);
-    (!sections.is_empty()).then(|| sections.join("\n\n"))
+    let mut sections = ArticleBodySectionBuilder::new();
+    collect_html_blocks(language, root, &mut sections);
+    sections.finish()
+}
+
+struct ArticleBodySectionBuilder {
+    sections: Vec<ArticleBodySection>,
+    current_heading: Option<ArticleBodyHeading>,
+    current_blocks: Vec<String>,
+}
+
+impl ArticleBodySectionBuilder {
+    fn new() -> Self {
+        Self {
+            sections: Vec::new(),
+            current_heading: None,
+            current_blocks: Vec::new(),
+        }
+    }
+
+    fn push_block(&mut self, block: String) {
+        self.current_blocks.push(block);
+    }
+
+    fn start_section(&mut self, heading: ArticleBodyHeading) {
+        self.flush();
+        self.current_heading = Some(heading);
+    }
+
+    fn finish(mut self) -> Vec<ArticleBodySection> {
+        self.flush();
+        self.sections
+    }
+
+    fn flush(&mut self) {
+        if self.current_blocks.is_empty() {
+            return;
+        }
+
+        self.sections.push(ArticleBodySection {
+            heading: self.current_heading.take(),
+            html: self.current_blocks.join("\n\n"),
+        });
+        self.current_blocks.clear();
+    }
 }
 
 fn mediawiki_references_to_telegram_html(language: &str, html: &str) -> Option<String> {
@@ -4410,9 +4585,8 @@ fn push_unique_link(links: &mut Vec<String>, url: String) {
 
 fn collect_html_blocks(
     language: &str,
-    title: &str,
     element: ElementRef<'_>,
-    sections: &mut Vec<String>,
+    sections: &mut ArticleBodySectionBuilder,
 ) {
     if should_skip_block(element) {
         return;
@@ -4423,52 +4597,47 @@ fn collect_html_blocks(
         "p" => {
             let rendered = trim_html_spacing(&render_inline_element(language, element));
             if !rendered.is_empty() {
-                sections.push(rendered);
+                sections.push_block(rendered);
             }
         }
         "blockquote" => {
             let rendered = trim_html_spacing(&render_inline_element(language, element));
             if !rendered.is_empty() {
-                sections.push(format!("<blockquote>{rendered}</blockquote>"));
+                sections.push_block(format!("<blockquote>{rendered}</blockquote>"));
             }
         }
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let rendered = trim_html_spacing(&render_inline_element(language, element));
             let heading_text = html_to_plain_text(&rendered);
             if !rendered.is_empty() && !is_terminal_article_heading(&heading_text) {
-                let header = element_anchor_id(element)
-                    .map(|anchor| {
-                        html_bold_link(
-                            &format!("{}#{anchor}", article_url(language, title)),
-                            &heading_text,
-                        )
-                    })
-                    .unwrap_or_else(|| format!("<b>{rendered}</b>"));
-                sections.push(header);
+                sections.start_section(ArticleBodyHeading {
+                    title: heading_text,
+                    anchor: element_anchor_id(element),
+                });
             }
         }
         "ul" => {
             let rendered = render_list(language, element, false);
             if !rendered.is_empty() {
-                sections.push(rendered);
+                sections.push_block(rendered);
             }
         }
         "ol" => {
             let rendered = render_list(language, element, true);
             if !rendered.is_empty() {
-                sections.push(rendered);
+                sections.push_block(rendered);
             }
         }
         "table" => {
             let rendered = render_table(language, element);
             if !rendered.is_empty() {
-                sections.push(rendered);
+                sections.push_block(rendered);
             }
         }
         _ => {
             for child in element.children() {
                 if let Some(child_element) = ElementRef::wrap(child) {
-                    collect_html_blocks(language, title, child_element, sections);
+                    collect_html_blocks(language, child_element, sections);
                 }
             }
         }
@@ -5470,6 +5639,7 @@ fn coordinate_direction_is_negative(direction: &str) -> bool {
         || direction.starts_with('з')
 }
 
+#[cfg(test)]
 fn split_telegram_text(text: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     if text.chars().count() <= limit {
@@ -5554,6 +5724,7 @@ fn split_html_lines_for_telegram(html: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+#[cfg(test)]
 fn split_long_paragraph(paragraph: &str, limit: usize) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -5584,6 +5755,7 @@ fn split_long_paragraph(paragraph: &str, limit: usize) -> Vec<String> {
     parts
 }
 
+#[cfg(test)]
 fn split_long_word(word: &str, limit: usize) -> Vec<String> {
     let chars = word.chars().collect::<Vec<_>>();
     chars
@@ -6065,11 +6237,24 @@ struct ArticleContent {
     infobox: Option<String>,
     infobox_image: Option<MediaItem>,
     body_html: Option<String>,
+    body_sections: Vec<ArticleBodySection>,
     references_html: Option<String>,
     body_links: Vec<NavLink>,
     nav_templates: Vec<NavTemplate>,
     is_disambiguation: bool,
     disambiguation_links: Vec<NavLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArticleBodySection {
+    heading: Option<ArticleBodyHeading>,
+    html: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArticleBodyHeading {
+    title: String,
+    anchor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7130,6 +7315,7 @@ mod tests {
                 "A <a href=\"https://en.wikipedia.org/wiki/Linked_Article\">Linked Article</a> body."
                     .to_string(),
             ),
+            body_sections: Vec::new(),
             references_html: None,
             body_links: Vec::new(),
             nav_templates: Vec::new(),
@@ -7162,6 +7348,7 @@ mod tests {
             infobox: None,
             infobox_image: None,
             body_html: Some([linked_line.as_str(); 10].join("\n")),
+            body_sections: Vec::new(),
             references_html: None,
             body_links: Vec::new(),
             nav_templates: Vec::new(),
@@ -7175,6 +7362,75 @@ mod tests {
         for part in parts {
             assert_eq!(part.matches("<a ").count(), part.matches("</a>").count());
         }
+    }
+
+    #[test]
+    fn article_body_sections_split_with_clickable_article_and_italic_section_prefixes() {
+        let article = ArticleContent {
+            title: "Example Article".to_string(),
+            extract: String::new(),
+            length: Some(1000),
+            infobox: None,
+            infobox_image: None,
+            body_html: None,
+            body_sections: vec![
+                ArticleBodySection {
+                    heading: None,
+                    html: "Lead body.".to_string(),
+                },
+                ArticleBodySection {
+                    heading: Some(ArticleBodyHeading {
+                        title: "History".to_string(),
+                        anchor: Some("History".to_string()),
+                    }),
+                    html: "History body.".to_string(),
+                },
+            ],
+            references_html: None,
+            body_links: Vec::new(),
+            nav_templates: Vec::new(),
+            is_disambiguation: false,
+            disambiguation_links: Vec::new(),
+        };
+
+        let parts = render_article_html_parts("en", &article, 320);
+
+        assert!(parts.len() >= 3);
+        assert!(parts.iter().any(|part| part.starts_with(
+            "<a href=\"https://en.wikipedia.org/wiki/Example_Article\">Example Article</a>: <i><a href=\"https://en.wikipedia.org/wiki/Example_Article\">Lead</a></i>"
+        )));
+        assert!(parts.iter().any(|part| part.starts_with(
+            "<a href=\"https://en.wikipedia.org/wiki/Example_Article\">Example Article</a>: <i><a href=\"https://en.wikipedia.org/wiki/Example_Article#History\">History</a></i>"
+        )));
+    }
+
+    #[test]
+    fn mediawiki_html_to_telegram_sections_preserves_heading_anchors() {
+        let html = r#"
+            <p>Lead body.</p>
+            <h2><span class="mw-headline" id="History">History</span></h2>
+            <p>History body.</p>
+            <h2>References</h2>
+            <ol class="references"><li>Reference body.</li></ol>
+        "#;
+
+        let sections = mediawiki_html_to_telegram_sections("en", "Example Article", html);
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading, None);
+        assert_eq!(
+            sections[1].heading,
+            Some(ArticleBodyHeading {
+                title: "History".to_string(),
+                anchor: Some("History".to_string()),
+            })
+        );
+        assert!(sections[1].html.contains("History body."));
+        assert!(
+            !sections
+                .iter()
+                .any(|section| section.html.contains("Reference body"))
+        );
     }
 
     #[test]
@@ -7431,6 +7687,7 @@ mod tests {
             infobox: None,
             infobox_image: None,
             body_html: Some("This body must not be dumped.".to_string()),
+            body_sections: Vec::new(),
             references_html: None,
             body_links: Vec::new(),
             nav_templates: Vec::new(),

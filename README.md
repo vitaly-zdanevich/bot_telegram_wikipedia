@@ -28,6 +28,9 @@ Public bot: https://t.me/wikipedia_unofficial_bot
   replace the automatic gallery with an `Images (N)` button.
 - Render article and metadata headers in bold. Article section headers link to
   their Wikipedia section anchors.
+- Split article bodies by section when MediaWiki exposes headings. Each section
+  message starts with a clickable article title and an italic clickable section
+  title.
 - Preserve normal clickable internal Wikipedia links inside the article body.
 - Send the first 20 unique internal article-body links as callback buttons after
   references and before navigation/category buttons.
